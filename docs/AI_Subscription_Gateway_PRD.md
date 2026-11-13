@@ -1,6 +1,6 @@
-# AI subscription gateway
+# RouteInlet AI subscription gateway
 
-PRODUCT REQUIREMENTS DOCUMENT     ·     REVIEW DRAFT     ·     12 NOVEMBER 2026
+PRODUCT REQUIREMENTS DOCUMENT     ·     REVIEW DRAFT     ·     13 NOVEMBER 2026
 
 A developer should be able to connect an eligible AI subscription to a project, run a real product feature, and decide whether metered API access is worth buying. The gateway should show what reached the model and which account funded each request.
 
@@ -16,9 +16,25 @@ Ship a self-hosted HTTP service with a command-line interface, native executable
 | Spending | Start with subscription usage. When the configured quota policy activates a paid route, continue automatically and notify the calling application. |
 | Testing | Preserve inputs by default. Developers opt into token-saving transformations and can measure their effect on task quality. |
 
-## Decision still open
+## Target subscriptions and pilot scope
 
-The first provider, pilot application, and implementation language remain open. The launch dependency is a subscription connection whose supported operations and permitted deployment match the pilot. A working local login alone does not establish project-wide production eligibility.
+The product targets the personal subscriptions developers already buy. The project owner connects once. The host application manages its users. The prices below identify the intended tiers. They do not determine connector eligibility or the billing source of an individual request.
+
+| Target plan | Evidence for the intended use | Product decision |
+| --- | --- | --- |
+| ChatGPT Plus (₹1,999/month target in India) | OpenAI documents a consent flow for eligible plan-backed Responses API calls in personal local and open-source applications. The owner must grant plan usage in addition to signing in. | Proposed first pilot: a developer runs their own feature using their own Plus account. Verify the specific model and operations live. Hosted use serving other users on the owner's plan remains unverified. |
+| Claude Pro ($20/month) | Anthropic supports personal subscription sign-in through its official client and restricts third-party collection of consumer credentials and routing on behalf of end users. | Track as a target. Activating a general project connector requires a provider-supported integration for that deployment. Claude Code sign-in alone does not qualify it. |
+| Cursor Plus ($8/month) | The included allowance covers eligible first-party usage on supported Cursor and Grok surfaces. Third-party models are unavailable on this tier. | Track as a target. Verify an external-app route that draws from the included allowance before enabling a connector. |
+| Cursor Premium ($30/month) | Includes four times the Plus allowance. Third-party model usage in Cursor is billed separately from prepaid credit at API list price. | Verify first-party allowance access separately from paid model access. A successful third-party call cannot count as a subscription-funded pilot result. |
+
+### Owner-run pilot and acceptance criteria
+
+The product owner will choose an existing application and one AI feature with independently checkable results. An invoice extractor with known totals and currencies is one possible fixture. The gateway remains independent of the pilot app's language.
+
+1. **Connect and verify funding.** With metered fallback disabled and no paid API key configured, authorize the intended plan, send a live request from the application, and record the request ID, model, operation, and available provider usage evidence. Mark the funding allocation unknown when the provider does not expose it.
+2. **Check the feature.** Run one supported input against the app's expected result. Submit a second request with a known incompatible mandatory field and confirm preflight names the field before inference.
+3. **Exercise quota and fallback.** On a simulated quota event, verify the subscription-only error. Repeat with a configured compatible paid route and verify automatic continuation and a caller-visible warning on that request. Record a real quota transition separately when observed.
+4. **Qualify the deployment.** Record the plan, authorized account, intended audience, host, and operations tested. Validate workstations and supported headless deployments separately. Claim project-wide production support only when provider documentation or an agreement covers the intended audience and the deployment passes its live tests.
 
 ## Developer experience
 
@@ -35,9 +51,9 @@ The primary user is a developer adding AI to an existing application. The operat
 ### Illustrative CLI
 
 ```bash
-ai-gateway connect --project demo
-ai-gateway capabilities --project demo
-ai-gateway start --project demo
+routeinlet connect --project demo
+routeinlet capabilities --project demo
+routeinlet start --project demo
 ```
 
 Names and flags are proposed. Setup must work without a gateway dashboard. A remote operator can complete any required provider authorization through a supported browser flow on a separate device.
@@ -84,6 +100,8 @@ Gateway-Fallback-Reason: subscription_quota_exhausted
 
 Example app message: “Your subscription allowance was reached. This request used the configured paid API.” Send route metadata in HTTP headers before the first output event. Keep the provider’s JSON and streaming payload intact. Record the same transition for background jobs and charge estimates after completion.
 
+Record the selected connection separately from the provider's allocation of charges. Emit a paid-fallback warning when RouteInlet switches to a configured metered connection. If the provider allocates included and paid balances internally and supplies no per-request evidence, report the allocation as unknown.
+
 Treat reported resets, token counts, and prices as independent facts. A provider may expose a quota window without a token balance. Show unavailable values as unknown and label estimates with the price version.
 
 ## Optimization and evaluation
@@ -128,7 +146,7 @@ Measure p95 gateway overhead on a fixed synthetic upstream at 20 concurrent clie
 
 | Stage | Deliverable | Exit evidence |
 | --- | --- | --- |
-| Feasibility | Select the pilot workflow and verify one provider plan for its deployment and audience. | Document owner scope and supported operations. Demonstrate one authorized live feature end to end. |
+| Feasibility | Select the pilot workflow and evaluate ChatGPT Plus first for owner-run use. | Document owner scope and supported operations. Demonstrate one authorized live feature end to end. |
 | Private alpha | Ship CLI, executable, container, native HTTP route, discovery, preflight, request metadata, and quota-triggered fallback. | Exercise laptop and headless deployments. Validate normal, incompatible, and exhausted-quota requests with fixtures and an eligible live route. |
 | Public beta | Add opt-in optimization and paired evaluation. Publish the tested capability and deployment matrix. | Two independent projects using different client languages complete integration. Compare task outcomes on owner-supplied examples. |
 | Broader release | Expand adapters and operations with evidence. Add the dashboard after observing common operator tasks. | Each newly advertised connector passes its own compatibility, quota, and billing tests for the deployment claimed. |
@@ -141,7 +159,7 @@ Reliability fixtures cover an expired login, a temporary 429, exhausted quota wi
 
 ### Open decisions
 
-Product owner selects the first provider, pilot project, and quality checks after feasibility review. Engineering proposes the runtime, exact API names, secret-store support, and tested CPU architectures. Numeric targets above are review proposals. Release dates depend on connector feasibility and pilot results.
+The four target plans are in scope. The product owner selects the pilot application and quality checks. Go is the proposed implementation language for the CLI and HTTP service. The runtime decision, exact API names, secret-store support, and supported CPU architectures remain open. Numeric targets above are review proposals. Release dates depend on connector feasibility and pilot results.
 
 ## Evidence and launch dependencies
 
@@ -169,8 +187,12 @@ CLIProxyAPI removes specific fields in its xAI Responses path. Its WebSocket han
 
 ### Provider feasibility
 
-OpenAI documents eligible requests against a consenting user’s plan for open-source and locally hosted apps and directs paid or remotely hosted apps to an interest process. Anthropic restricts third-party routing on behalf of users through consumer Claude plan credentials. Cursor and Grok remain candidates pending provider-specific verification. No project-wide consumer plan has been validated for launch.
+The plan matrix above reflects published provider documentation. Live account tests and confirmation of project-wide consumer-plan eligibility are pending. Capture the plan, deployment, evidence date, and verified operations when changing a connector’s status.
 
 [OpenAI  ·  ChatGPT plan usage and deployment eligibility](https://developers.openai.com/siwc/token-sharing-open-source)
 
 [Anthropic  ·  Claude Code authentication and credential use](https://code.claude.com/docs/en/legal-and-compliance)
+
+[Cursor · Plan allowances and third-party pricing](https://cursor.com/docs/models-and-pricing)
+
+[Cursor and Grok · Included usage and eligible surfaces](https://docs.x.ai/x-subscription/usage-limits)
