@@ -8,7 +8,7 @@ This review draft defines the planned behavior. The guarantee covers paid dispat
 
 ## Product decision
 
-Ship a self-hosted HTTP service with a command-line interface, native executables, and a container image. The project owner configures the upstream connection once. The application keeps its own users, permissions, and interface. An optional admin UI follows the first release.
+Deliver the self-hosted HTTP service and CLI first on the pilot host. Expand distribution in the stages defined below. The project owner configures the upstream connection once. The application keeps its own users, permissions, and interface. An optional admin UI follows the first release.
 
 | Decision | Product requirement |
 | --- | --- |
@@ -36,14 +36,14 @@ Maintain a dated evidence record per plan, account tier, client/connector versio
 | Check | Required evidence |
 | --- | --- |
 | Real application request | A reference app sends the request and validates the result against a feature-specific assertion. Link the request ID to its upstream outcome. |
-| Streaming and conversation history | The app receives ordered native stream events and completion. A follow-up question correctly uses a fact supplied only in the previous turn. |
+| Streaming and conversation history | The app receives ordered pilot API stream events and completion. A follow-up question correctly uses a fact supplied only in the previous turn. |
 | Account model access | Compare advertised models with those available to the connected account. Exercise the selected model and report the actual model when observable. |
 | Expiry and renewal | Observe renewal or required reauthorization, recovery after restart, and an actionable diagnostic when renewal fails. |
 | Quota and funding | Distinguish exhausted allowance, transient throttling, and unknown causes. Record provider evidence for included or additional charges. Label fixtures separately from live observations. |
 
 ### Alpha scope and transport selection
 
-Start with one project and one gateway process. Include subscription connections, request preflight, native streaming, conversation continuity, request history, and optional notified paid fallback. Defer compression, semantic caching, a large dashboard, distributed replicas, and broad protocol emulation until the baseline passes the release gates.
+Start with one project and one gateway process. Include subscription connections, request preflight, incremental streaming, conversation continuity, request history, and optional notified paid fallback. Defer compression, semantic caching, a large dashboard, distributed replicas, and broad protocol emulation until the baseline passes the release gates.
 
 Evaluate CLIProxyAPI for Claude and ChatGPT and 9Router for Cursor. Pin the engine version and verify that internal fallback, retries, and request transformations can be disabled or exposed to RouteInlet's policy before execution. Reject a transport for a route if it can silently substitute a model, replay an operation, alter required inputs, or trigger spend outside that policy.
 
@@ -65,9 +65,9 @@ The primary user is a developer adding AI to an existing application. The operat
 
 | Step | Developer experience | Evidence of success |
 | --- | --- | --- |
-| Install | Download an executable or run the published container image. | The same version reports readiness on a laptop and in a headless environment. |
+| Install | Follow the instructions for the current release stage. | Alpha starts on the documented pilot OS and architecture. Later stages qualify additional packages. |
 | Connect | Select a project, authorize an eligible plan, and inspect supported models and operations. | The CLI reports owner scope, connection health, deployment profile, and verified capabilities. |
-| Integrate | Point the app’s backend at the gateway using an HTTP client or compatible SDK. | A real feature returns its expected provider response format, with a traceable request ID. |
+| Integrate | Point the app’s backend at the gateway using an HTTP client or compatible SDK. | A real feature receives the documented pilot response format, with a traceable request ID. |
 | Evaluate | Run representative inputs and existing app assertions. Capture baseline results for later optimization comparisons. | The owner can compare task success, latency, and measured or estimated usage. |
 | Continue | Configure paid routes, allowed triggers, a spending limit, and the application’s notification receiver once. | The reference app displays the transition notice and its receiver acknowledges delivery before paid dispatch. |
 
@@ -97,9 +97,27 @@ The gateway makes routing decisions at the level of operation, model, transport,
 | R4 | Pass provider-specific extensions through on native routes. Report unknown compatibility where evidence is incomplete. In strict evaluation mode, require verification for declared mandatory features. | A new optional native field reaches its provider. Unknown support for a mandatory field is visible to the caller. |
 | R5 | Expose additional operations as adapters verify them. Track text, files, images, audio, embeddings, batch, and stateful operations separately. | Discovery lists each operation with its supported transport and limitations. An unsupported call returns a typed error. |
 
-### Developer facing API
+### Pilot application API contract
 
-Proposed routes include GET /gateway/v1/capabilities and POST /gateway/v1/preflight. Provider operations retain their adapter-documented native paths, request bodies, status codes, and event formats. Preflight is local and advisory. Dispatch rechecks compatibility and eligibility because connection state can change.
+The pilot calls **`POST /v1/chat/completions`** using the streaming text subset of OpenAI Chat Completions. Every pilot adapter implements this same downstream contract. The app submits the full ordered history on each turn.
+
+```json
+{"model":"pilot-model","stream":true,"messages":[{"role":"system","content":"Answer briefly."},{"role":"user","content":"My reference is A17."},{"role":"assistant","content":"Understood."},{"role":"user","content":"What is my reference?"}]}
+```
+
+The request requires a configured model ID, `stream: true`, and text messages with system, user, or assistant roles. The response is UTF-8 SSE (`text/event-stream`) with ordered `chat.completion.chunk` data events, incremental `choices[0].delta.content`, a mapped finish reason, and a final `data: [DONE]` on success. Before commitment, return a structured HTTP error naming the field and reason. After commitment, signal failure in-stream when writable and close without a successful completion marker. Cancellation propagates upstream.
+
+| Adapter | Pilot mapping to qualify |
+| --- | --- |
+| Claude | Map system instructions and ordered conversation turns into the selected Claude transport. Map text deltas, completion reasons, and terminal errors back to the pilot stream. |
+| ChatGPT | Map system instructions and ordered history into eligible Responses input. Map provider text deltas and terminal events into the pilot stream. |
+| Cursor Plus and Premium | Keep protobuf framing and HTTP/2 within the adapter under evaluation. Qualify the mapping of roles, history, text, finish reasons, and errors separately for each tier. The pilot app always uses JSON and SSE. |
+
+Publish a versioned mapping for each adapter and record transformations in preflight. If a requested field, modality, tool, or schema lacks a faithful mapping, reject the call before inference and identify its field path. Provider-native endpoints may be added as separately qualified interfaces. The pilot contract makes no promise of full SDK or cross-provider feature parity.
+
+**Contract test.** Send the same two-turn fixture over HTTP to every adapter seeking qualification. Assert preserved system instructions, message order, incremental deltas, one successful terminator, and the correct reference in the second answer. An unsupported required field must yield a field-specific error and zero inference calls.
+
+Management endpoints remain `GET /gateway/v1/capabilities` and `POST /gateway/v1/preflight`. Preflight is local and advisory. Dispatch rechecks route eligibility and compatibility.
 
 ## Quota and paid fallback
 
@@ -112,7 +130,11 @@ Recheck compatibility at each step. The owner policy must authorize any model or
 | Confirmed quota exhaustion | Try approved compatible subscription alternatives in order. Enter paid fallback only for an explicitly allowed trigger. Otherwise return the reason and reset time if known. |
 | Generic HTTP 429, expired login, unexplained upstream failure | Classify the cause if evidence permits. Honor retry timing within the deadline or return reauthorization or diagnostic guidance. None of these signals alone activates paid fallback. |
 | Incompatible candidate | Record the conflicting field and skip the candidate. Return a typed error if no eligible route remains. |
-| Partial output or uncertain execution | Once output reaches the app, terminate the stream with an explicit error on failure. When an upstream execution outcome is unknown, surface that state and stop automatic replay. |
+| Committed response or uncertain execution | Stop fallback and replay immediately when final downstream HTTP headers are committed or upstream execution becomes uncertain, whichever occurs first. This applies to native and translated streams. |
+
+**Stream commitment.** Committing means writing or flushing the final HTTP status and headers to the downstream response, explicitly or implicitly through any body write. A heartbeat, role-only event, or empty initial event also commits the response if headers were still buffered. The first model text can arrive later. Before commitment, a switch still requires a known safe upstream outcome and the configured policy. After commitment, retain the chosen route, report failure where the protocol permits, and close. Record uncertainty even if the app has already disconnected.
+
+**Boundary tests.** Inject failure after a headers-only flush, after an initial SSE event but before text, and before headers with an unknown upstream outcome. Each case must produce zero further dispatches. A confirmed pre-header quota rejection with a known non-execution outcome exercises the eligible fallback path.
 
 ### Automatic paid fallback and delivery guarantee
 
@@ -122,7 +144,11 @@ The owner configures the allowed routes, triggers, enforceable spend limits, and
 2. Persist the pending funding change, reservation, and a stable transition ID before contacting the receiver.
 3. Deliver a notice identifying the request, proposed paid route, model, trigger, and reserved amount. The receiver acknowledges the same transition ID after accepting the notice for delivery. Deduplicate notification retries using that ID.
 4. Persist the acknowledgment before sending the paid request. On delivery failure, timeout, or invalid acknowledgment, stop paid dispatch and return a notification error. Release the reservation once the gateway establishes the request was never dispatched.
-5. Record the dispatch and its outcome. Reconcile against provider-reported charges when available. After a crash with uncertain dispatch or final usage, retain the reservation for reconciliation and surface the uncertainty.
+5. **Immediately before paid dispatch**, recheck client cancellation, the request deadline, current owner policy for the exact trigger and route, and the reservation's validity, ownership, and amount. Also require an uncommitted downstream response and a known safe prior outcome. Serialize dispatch authorization with cancellation, policy revocation, and reservation invalidation. Only one attempt may claim the transition. Use the request's cancellation context for the outbound call. A late or duplicate acknowledgment cannot revive a stopped request.
+6. If any check fails, record the reason, send no paid request, and release the reservation once non-dispatch is established. A cancellation after transmission may leave a charge outstanding.
+7. Record the dispatch and its outcome. Reconcile against provider-reported charges when available. After a crash with uncertain dispatch or final usage, retain the reservation for reconciliation and surface the uncertainty.
+
+**Dispatch race tests.** Pause the receiver, then cancel the request or advance past its deadline before returning an acknowledgment. Repeat with policy revoked or the reservation expired between acknowledgment and dispatch. Assert zero calls at the paid upstream in all four cases. A valid acknowledgment with all checks passing permits one call, including when a duplicate acknowledgment arrives.
 
 The reference application must display the notice in its interaction history, including for streaming requests. Test receiver delivery and visible display separately. Response headers carry the same transition ID and billing metadata without altering the model response.
 
@@ -166,7 +192,10 @@ A single service owns connection setup, project authentication, preflight, routi
 
 | Area | Release requirement |
 | --- | --- |
-| Distribution | Publish versioned native builds for macOS, Windows, and Linux and a Linux container image. Validate the named OS and architecture combinations before advertising support. |
+| Connectivity proof | One reproducible source or development build on the pilot host is sufficient. Record the commit, OS, architecture, and start command alongside the live result. |
+| Private alpha | Provide one documented installation path on the selected pilot OS and architecture. Verify clean install, startup, and restart for one project and one process. |
+| Beta distribution | Publish a versioned Linux container for a declared architecture and verify headless startup and persistent state. |
+| Broader distribution | Publish native macOS, Windows, and Linux builds as their OS and architecture combinations pass install, start, and upgrade tests. Publish the tested matrix. |
 | Service lifecycle | Provide readiness and liveness checks, graceful shutdown, configuration validation, and durable connection state across restarts. Expired credentials produce a reauthorization action. |
 | Secrets and isolation | Keep provider credentials server-side. Use OS credential storage or deployment secrets. Separate project access keys and admin rights. Isolate metering, caches, and configuration by project. |
 | Data handling | Log request ID, route, model, billing source, status, and timing. Omit raw prompts, files, outputs, and credentials by default. Allow bounded, explicit capture for evaluation with a deletion control. |
@@ -182,9 +211,9 @@ Measure p95 gateway overhead on a fixed synthetic upstream at 20 concurrent clie
 | Gate | Exit requirement |
 | --- | --- |
 | Connectivity | One exact plan completes the chosen application task through RouteInlet. Record authentication, inference, funding evidence or unknown, and feature results separately. |
-| Fidelity | Required inputs, native streaming, conversation history, and relevant tools survive intact. An incompatible fixture reports its field before inference. |
-| Billing | Every paid dispatch correlates to an owner policy, durable reservation, and acknowledged notice. Receiver failure yields zero paid dispatches. Demonstrate the notice in the reference app. |
-| Reliability | Pass quota, renewal, cancellation, partial-stream, concurrency, and crash fixtures. Exercise restart both before acknowledgment and after a potentially billable dispatch. Verify uncertain outcomes cannot cause replay or release reserved spend prematurely. |
+| Fidelity | Required inputs, the declared stream contract, conversation history, and relevant supported tools survive intact. An incompatible fixture reports its field before inference. |
+| Billing | Every paid dispatch correlates to an owner policy, durable reservation, and acknowledged notice. Receiver failure, late acknowledgment after cancellation or deadline, policy revocation, and invalid reservation each yield zero paid dispatches. Demonstrate the notice in the reference app. |
+| Reliability | Pass quota, renewal, cancellation, headers-only commitment, initial-event commitment, unknown pre-header execution, concurrency, and crash fixtures. Exercise restart both before acknowledgment and after a potentially billable dispatch. Verify uncertain outcomes cannot cause replay or release reserved spend prematurely. |
 | Expansion | Each additional plan and deployment passes its own qualification checks. Record provider evidence for the intended audience. |
 
 Release progression depends on gate evidence. Report simulated quota and crash behavior separately from live provider observations. As a proposed usability target, at least four of five pilot developers should complete a first live request within 15 minutes of installation with an eligible account.
