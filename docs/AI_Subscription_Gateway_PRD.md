@@ -2,7 +2,9 @@
 
 PRODUCT REQUIREMENTS DOCUMENT     ·     REVIEW DRAFT     ·     13 NOVEMBER 2026
 
-A developer should be able to connect an eligible AI subscription to a project, run a real product feature, and decide whether metered API access is worth buying. The gateway should show what reached the model and which account funded each request.
+> **Use the AI subscriptions you already pay for in your applications. Spend on paid APIs only when you enable fallback—and always know when that happens.**
+
+This review draft defines the planned behavior. The guarantee covers paid dispatches that RouteInlet controls. If a provider can charge overage on the same credential, the gateway must identify that exposure before use. Only routes with enforceable included-only usage qualify for a strict subscription-only policy.
 
 ## Product decision
 
@@ -13,28 +15,49 @@ Ship a self-hosted HTTP service with a command-line interface, native executable
 | Ownership | Each project controls its connections, quota policy, fallback credentials, and access to its gateway. |
 | Portability | Any language that can call HTTP can use the service. Support workstations, CI, and server deployments with the same request contract. |
 | API coverage | Expose verified operations on each connection. Preserve native behavior and identify unsupported or unverified features explicitly. |
-| Spending | Start with subscription usage. When the configured quota policy activates a paid route, continue automatically and notify the calling application. |
+| Spending | Start with subscription usage. Before automatic paid dispatch, enforce the owner's trigger and spend cap and obtain delivery acknowledgment from the configured receiver. |
 | Testing | Preserve inputs by default. Developers opt into token-saving transformations and can measure their effect on task quality. |
 
 ## Target subscriptions and pilot scope
 
-The product targets the personal subscriptions developers already buy. The project owner connects once. The host application manages its users. The prices below identify the intended tiers. They do not determine connector eligibility or the billing source of an individual request.
+Investigate all four plans in the order below. Existing connectors, authenticated client execution, and undocumented protocols are in scope for technical investigation. An official integration is not a prerequisite for investigation. Record technical findings separately from the provider terms and deployment evidence needed to advertise support. Live account tests remain outstanding for every row.
 
-| Target plan | Evidence for the intended use | Product decision |
+| Order | Exact target plan | Investigation and deployment question |
 | --- | --- | --- |
-| ChatGPT Plus (₹1,999/month target in India) | OpenAI documents a consent flow for eligible plan-backed Responses API calls in personal local and open-source applications. The owner must grant plan usage in addition to signing in. | Proposed first pilot: a developer runs their own feature using their own Plus account. Verify the specific model and operations live. Hosted use serving other users on the owner's plan remains unverified. |
-| Claude Pro ($20/month) | Anthropic supports personal subscription sign-in through its official client and restricts third-party collection of consumer credentials and routing on behalf of end users. | Track as a target. Activating a general project connector requires a provider-supported integration for that deployment. Claude Code sign-in alone does not qualify it. |
-| Cursor Plus ($8/month) | The included allowance covers eligible first-party usage on supported Cursor and Grok surfaces. Third-party models are unavailable on this tier. | Track as a target. Verify an external-app route that draws from the included allowance before enabling a connector. |
-| Cursor Premium ($30/month) | Includes four times the Plus allowance. Third-party model usage in Cursor is billed separately from prepaid credit at API list price. | Verify first-party allowance access separately from paid model access. A successful third-party call cannot count as a subscription-funded pilot result. |
+| 1 | Claude Pro · $20/month | Evaluate CLIProxyAPI’s Claude transport and authenticated native client execution. Anthropic restricts third-party credential collection and routing on behalf of end users. Record the audience and deployment each finding covers. |
+| 2 | ChatGPT Plus · ₹1,999/month target in India | Evaluate CLIProxyAPI’s ChatGPT transport and the documented plan-usage consent flow. Verify live inference and allowance evidence for the authorized owner and deployment. |
+| 3 | Cursor Plus · $8/month | Evaluate 9Router’s Cursor adapter with an actual Plus account. Verify account-visible first-party models, allowance evidence, and supported deployment. |
+| 4 | Cursor Premium · $30/month | Repeat qualification on Premium. Test included first-party usage separately from third-party models billed from prepaid credit. |
 
-### Owner-run pilot and acceptance criteria
+### Milestone one: subscription connectivity
 
-The product owner will choose an existing application and one AI feature with independently checkable results. An invoice extractor with known totals and currencies is one possible fixture. The gateway remains independent of the pilot app's language.
+Maintain a dated evidence record per plan, account tier, client/connector version, and deployment. Advance each plan through **authentication → completed inference → included-usage evidence → application-feature validation**. Record unknown funding when the provider supplies insufficient evidence. A valid credential or a completed response alone cannot establish included usage.
 
-1. **Connect and verify funding.** With metered fallback disabled and no paid API key configured, authorize the intended plan, send a live request from the application, and record the request ID, model, operation, and available provider usage evidence. Mark the funding allocation unknown when the provider does not expose it.
-2. **Check the feature.** Run one supported input against the app's expected result. Submit a second request with a known incompatible mandatory field and confirm preflight names the field before inference.
-3. **Exercise quota and fallback.** On a simulated quota event, verify the subscription-only error. Repeat with a configured compatible paid route and verify automatic continuation and a caller-visible warning on that request. Record a real quota transition separately when observed.
-4. **Qualify the deployment.** Record the plan, authorized account, intended audience, host, and operations tested. Validate workstations and supported headless deployments separately. Claim project-wide production support only when provider documentation or an agreement covers the intended audience and the deployment passes its live tests.
+| Check | Required evidence |
+| --- | --- |
+| Real application request | A reference app sends the request and validates the result against a feature-specific assertion. Link the request ID to its upstream outcome. |
+| Streaming and conversation history | The app receives ordered native stream events and completion. A follow-up question correctly uses a fact supplied only in the previous turn. |
+| Account model access | Compare advertised models with those available to the connected account. Exercise the selected model and report the actual model when observable. |
+| Expiry and renewal | Observe renewal or required reauthorization, recovery after restart, and an actionable diagnostic when renewal fails. |
+| Quota and funding | Distinguish exhausted allowance, transient throttling, and unknown causes. Record provider evidence for included or additional charges. Label fixtures separately from live observations. |
+
+### Alpha scope and transport selection
+
+Start with one project and one gateway process. Include subscription connections, request preflight, native streaming, conversation continuity, request history, and optional notified paid fallback. Defer compression, semantic caching, a large dashboard, distributed replicas, and broad protocol emulation until the baseline passes the release gates.
+
+Evaluate CLIProxyAPI for Claude and ChatGPT and 9Router for Cursor. Pin the engine version and verify that internal fallback, retries, and request transformations can be disabled or exposed to RouteInlet's policy before execution. Reject a transport for a route if it can silently substitute a model, replay an operation, alter required inputs, or trigger spend outside that policy.
+
+### Application reliability benchmark
+
+| Promise | Acceptance criterion |
+| --- | --- |
+| Preserve the feature | Images, instructions, tool definitions, conversation history, and required output schemas survive routing intact. |
+| Explain incompatibility | Preflight identifies the conflicting field before inference, including on alternative routes. |
+| Make funding visible | Each request records the selected connection, actual model or unknown, funding evidence, and fallback reason. |
+| Recover predictably | Expiry, renewal failures, and upstream protocol changes produce diagnostics with a practical next action. |
+| Prevent surprise spending | A paid attempt has a matching policy decision, enforceable reservation, and acknowledged notice. |
+
+Run the same workload against pinned versions of RouteInlet and comparison gateways. Record configuration, model, fixtures, expected behavior, and observed results. Publish a comparative claim only for workloads and deployments tested.
 
 ## Developer experience
 
@@ -45,8 +68,8 @@ The primary user is a developer adding AI to an existing application. The operat
 | Install | Download an executable or run the published container image. | The same version reports readiness on a laptop and in a headless environment. |
 | Connect | Select a project, authorize an eligible plan, and inspect supported models and operations. | The CLI reports owner scope, connection health, deployment profile, and verified capabilities. |
 | Integrate | Point the app’s backend at the gateway using an HTTP client or compatible SDK. | A real feature returns its expected provider response format, with a traceable request ID. |
-| Evaluate | Run representative inputs and existing app assertions. Enable optimizations only when desired. | The owner can compare task success, latency, and measured or estimated usage. |
-| Continue | Configure a paid API credential and select quota exhaustion as a fallback trigger. | The app receives the expected result and a warning when the paid route serves it. |
+| Evaluate | Run representative inputs and existing app assertions. Capture baseline results for later optimization comparisons. | The owner can compare task success, latency, and measured or estimated usage. |
+| Continue | Configure paid routes, allowed triggers, a spending limit, and the application’s notification receiver once. | The reference app displays the transition notice and its receiver acknowledges delivery before paid dispatch. |
 
 ### Illustrative CLI
 
@@ -80,29 +103,41 @@ Proposed routes include GET /gateway/v1/capabilities and POST /gateway/v1/prefli
 
 ## Quota and paid fallback
 
-A project can register a subscription and a metered route. The owner defines when the second route may run. A configured quota-triggered fallback proceeds automatically and gives the app a warning it can display.
+**Routing order:** requested subscription → owner-approved compatible subscription alternatives → configured paid API → clear error.
 
-| Observed condition | Gateway behavior |
+Recheck compatibility at each step. The owner policy must authorize any model or provider substitution. Exhausting the subscription candidates does not itself authorize spending.
+
+| Condition | Required action |
 | --- | --- |
-| Quota exhausted | Use a configured, compatible fallback within its spend limit. Attach request ID, billing source, actual model, and reason. Without fallback, return quota_exhausted and the reset time if known. |
-| Transient throttling | Honor provider retry timing within the request deadline. A generic HTTP 429 alone does not establish that a weekly allowance is exhausted. Report an unknown cause when necessary. |
-| Model or feature changes | Evaluate the backup against the request. Use a different model only when the project allows it. Preserve required features or return a compatibility error. |
-| Partial stream or unknown outcome | After sending model output to the app, surface a terminal error if the stream breaks. Avoid replay when an upstream operation might already have executed. |
-| Concurrent spend | Where a cap is configured, reserve a conservative allowance atomically before paid dispatch. Reconcile against reported usage. Decline paid dispatch when the cap cannot be enforced. |
+| Confirmed quota exhaustion | Try approved compatible subscription alternatives in order. Enter paid fallback only for an explicitly allowed trigger. Otherwise return the reason and reset time if known. |
+| Generic HTTP 429, expired login, unexplained upstream failure | Classify the cause if evidence permits. Honor retry timing within the deadline or return reauthorization or diagnostic guidance. None of these signals alone activates paid fallback. |
+| Incompatible candidate | Record the conflicting field and skip the candidate. Return a typed error if no eligible route remains. |
+| Partial output or uncertain execution | Once output reaches the app, terminate the stream with an explicit error on failure. When an upstream execution outcome is unknown, surface that state and stop automatic replay. |
 
-### Warning the app can display
+### Automatic paid fallback and delivery guarantee
+
+The owner configures the allowed routes, triggers, enforceable spend limits, and notification receiver once. A receiver acknowledgment is automatic and requires no per-request human approval.
+
+1. Verify the trigger, route, actual request requirements, and an enforceable upper bound on the charge. Atomically reserve that maximum against the project budget. Stop if the bound cannot be enforced.
+2. Persist the pending funding change, reservation, and a stable transition ID before contacting the receiver.
+3. Deliver a notice identifying the request, proposed paid route, model, trigger, and reserved amount. The receiver acknowledges the same transition ID after accepting the notice for delivery. Deduplicate notification retries using that ID.
+4. Persist the acknowledgment before sending the paid request. On delivery failure, timeout, or invalid acknowledgment, stop paid dispatch and return a notification error. Release the reservation once the gateway establishes the request was never dispatched.
+5. Record the dispatch and its outcome. Reconcile against provider-reported charges when available. After a crash with uncertain dispatch or final usage, retain the reservation for reconciliation and surface the uncertainty.
+
+The reference application must display the notice in its interaction history, including for streaming requests. Test receiver delivery and visible display separately. Response headers carry the same transition ID and billing metadata without altering the model response.
 
 ```text
 Gateway-Request-Id: req_42
+Gateway-Transition-Id: transition_42
 Gateway-Billing-Source: metered_api
 Gateway-Fallback-Reason: subscription_quota_exhausted
 ```
 
-Example app message: “Your subscription allowance was reached. This request used the configured paid API.” Send route metadata in HTTP headers before the first output event. Keep the provider’s JSON and streaming payload intact. Record the same transition for background jobs and charge estimates after completion.
+### Provider-side overage and accounting
 
-Record the selected connection separately from the provider's allocation of charges. Emit a paid-fallback warning when RouteInlet switches to a configured metered connection. If the provider allocates included and paid balances internally and supplies no per-request evidence, report the allocation as unknown.
+Track three independent facts: the connection used, the allocation of usage (included, paid, mixed, or unknown), and charges (provider-reported, estimated with price version, or unavailable). A subscription credential may consume a paid balance internally without a gateway fallback. Record that as provider-side allocation. Keep unknown allocation unknown; a successful response, token count, or credential type alone supplies insufficient evidence.
 
-Treat reported resets, token counts, and prices as independent facts. A provider may expose a quota window without a token balance. Show unavailable values as unknown and label estimates with the price version.
+Under strict subscription-only policy, block a route if provider-side charges cannot be disabled or bounded at zero. Surface the reason in preflight. Persist reservations across restarts and concurrent requests. Missing final usage must never be treated as zero cost.
 
 ## Optimization and evaluation
 
@@ -144,22 +179,22 @@ Measure p95 gateway overhead on a fixed synthetic upstream at 20 concurrent clie
 
 ## Release plan and decision gates
 
-| Stage | Deliverable | Exit evidence |
-| --- | --- | --- |
-| Feasibility | Select the pilot workflow and evaluate ChatGPT Plus first for owner-run use. | Document owner scope and supported operations. Demonstrate one authorized live feature end to end. |
-| Private alpha | Ship CLI, executable, container, native HTTP route, discovery, preflight, request metadata, and quota-triggered fallback. | Exercise laptop and headless deployments. Validate normal, incompatible, and exhausted-quota requests with fixtures and an eligible live route. |
-| Public beta | Add opt-in optimization and paired evaluation. Publish the tested capability and deployment matrix. | Two independent projects using different client languages complete integration. Compare task outcomes on owner-supplied examples. |
-| Broader release | Expand adapters and operations with evidence. Add the dashboard after observing common operator tasks. | Each newly advertised connector passes its own compatibility, quota, and billing tests for the deployment claimed. |
+| Gate | Exit requirement |
+| --- | --- |
+| Connectivity | One exact plan completes the chosen application task through RouteInlet. Record authentication, inference, funding evidence or unknown, and feature results separately. |
+| Fidelity | Required inputs, native streaming, conversation history, and relevant tools survive intact. An incompatible fixture reports its field before inference. |
+| Billing | Every paid dispatch correlates to an owner policy, durable reservation, and acknowledged notice. Receiver failure yields zero paid dispatches. Demonstrate the notice in the reference app. |
+| Reliability | Pass quota, renewal, cancellation, partial-stream, concurrency, and crash fixtures. Exercise restart both before acknowledgment and after a potentially billable dispatch. Verify uncertain outcomes cannot cause replay or release reserved spend prematurely. |
+| Expansion | Each additional plan and deployment passes its own qualification checks. Record provider evidence for the intended audience. |
 
-### Proposed launch scorecard
+Release progression depends on gate evidence. Report simulated quota and crash behavior separately from live provider observations. As a proposed usability target, at least four of five pilot developers should complete a first live request within 15 minutes of installation with an eligible account.
 
-Activation: at least four of five pilot developers complete their first live request within 15 minutes after installing with an eligible account. Measure via pilot observation or opt-in reporting. Compatibility: every known incompatible mandatory field in the release fixtures is flagged before inference. Billing: every configured paid fallback carries a caller-visible warning, including a streaming case.
+### Open product choices
 
-Reliability fixtures cover an expired login, a temporary 429, exhausted quota with and without paid backup, concurrent requests at a spend cap, client cancellation, an interrupted stream, and a request whose upstream outcome is unknown. Release evidence distinguishes simulated quota transitions from provider-observed transitions.
+1. **First real application feature.** The provisional recommendation is a streaming text assistant with a multi-turn history check. The product owner will choose the pilot. Document extraction and tool-using applications follow as capability tests.
+2. **Initial setup experience.** The provisional recommendation is local CLI setup. Validate first-run connection and diagnostics with developers before finalizing onboarding. Retain headless and container deployment as platform goals.
 
-### Open decisions
-
-The four target plans are in scope. The product owner selects the pilot application and quality checks. Go is the proposed implementation language for the CLI and HTTP service. The runtime decision, exact API names, secret-store support, and supported CPU architectures remain open. Numeric targets above are review proposals. Release dates depend on connector feasibility and pilot results.
+Go remains an engineering proposal for the CLI and HTTP service. The runtime and packaging choices remain subject to the transport evaluation.
 
 ## Evidence and launch dependencies
 
