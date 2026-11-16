@@ -8,12 +8,12 @@ Test one project owner's ChatGPT Plus account through the Codex OAuth transport 
 
 Use the RouteInlet PR branch and a CLIProxyAPI executable built from commit `9a8ca1b577ef8573c5ccf108450b93ed57716cc4`. To build the connector from its checkout at that revision, use its Go toolchain and run `go build -o cli-proxy-api ./cmd/server`. The login flag and config layout are revision-specific. [CLI entry point](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/cmd/server/main.go) · [Configuration reference](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/config.example.yaml)
 
-Use a private local directory outside the checkout. The following shell example assumes macOS or Linux and a free gateway port 8787 and connector port 8318. Stop the previous gateway before switching pilots. Keep the same shell open for all three command blocks.
+Use a private local directory outside the checkout. The following shell example assumes macOS or Linux and a free gateway port 8787 and connector port 8318. Stop the previous gateway before switching pilots. Run the commands from the RouteInlet checkout in the same shell.
 
 ```sh
 go build -buildvcs=false -o routeinlet ./cmd/routeinlet
-CONNECTOR_BIN=/absolute/path/to/cli-proxy-api
-PILOT_DIR="$HOME/routeinlet-chatgpt-pilot"
+export CONNECTOR_BIN=/absolute/path/to/cli-proxy-api
+export PILOT_DIR="$HOME/routeinlet-chatgpt-pilot"
 export ROUTEINLET_CONNECTOR=http://127.0.0.1:8318
 export ROUTEINLET_CONNECTOR_KEY="$(openssl rand -hex 32)"
 export ROUTEINLET_KEY="$(openssl rand -hex 32)"
@@ -24,11 +24,18 @@ On first setup, the command creates a new profile with an empty auth directory, 
 
 ## Connect the owner account
 
-Start CLIProxyAPI in ordinary local file mode, with external credential stores and managed configurations disabled. Sign in with the Plus account you want to test. Keep one Codex credential in this profile. Check the account's plan, usage, credit balance, and automatic credit purchases before inference. If additional credits can be consumed, an inference result alone cannot establish included funding.
+Use the launcher below for both login and serving. It changes to the pilot directory and runs `check-chatgpt-pilot` before either connector invocation. The check rejects a local `.env`, managed or external-store environment overrides (including lowercase forms), and any configuration that differs from the generated profile for this directory and key. It verifies the local config and auth directory are real filesystem entries and prints the resolved auth directory. Confirm it is the new pilot's `auth` directory before completing sign-in. On a check failure, correct the reported cause and repeat the launch.
+
+The connector receives only `HOME` and a system `PATH`, a fixed config path, and flags selected by the launcher. The pinned connector loads `.env` from its working directory and selects Home, Postgres, object, or Git stores before falling back to the local file store. In local mode it resolves the configured absolute auth path. [Startup and store selection](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/cmd/server/main.go) · [Auth path resolution](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/internal/util/util.go)
+
+For the first login, start with the freshly generated empty auth directory. Open the login URL printed by the connector and sign in with the intended Plus account. Keep one Codex credential in this profile. Start the server only after login succeeds.
 
 ```sh
-"$CONNECTOR_BIN" -config "$PILOT_DIR/config.yaml" -codex-login
-"$CONNECTOR_BIN" -config "$PILOT_DIR/config.yaml" -local-model &
+sh examples/chatgpt-connector.sh login
+```
+
+```sh
+sh examples/chatgpt-connector.sh serve &
 CONNECTOR_PID=$!
 ```
 
@@ -41,7 +48,13 @@ export ROUTEINLET_MODEL='<replace with exact candidate ID>'
 GATEWAY_PID=$!
 ```
 
-Once the gateway is listening, run `python3 examples/probe.py`. Save the three request IDs and the reported model from each turn. When finished, stop the two processes with `kill "$GATEWAY_PID" "$CONNECTOR_PID"`.
+## Before sending any inference request
+
+**For an included-only run, skip live inference if paid credit consumption cannot be ruled out.** Check the selected account and workspace for spendable credits, automatic purchases, and any applicable provider-side spending controls. Turning off automatic purchases still leaves any existing balance available unless a separate control prevents its use. Record the controls or account evidence you relied on.
+
+If the controls are unavailable, ambiguous, or allow paid usage, stop before running the probe or sending a manual completion. Record `live inference skipped — paid credit exposure unresolved`. Proceed with that exposure only if the owner separately authorizes the expenditure for this run. Record that authorization and the run as potentially paid. A gateway funding value of `unknown` does not authorize spending.
+
+After satisfying the condition above, run `python3 examples/probe.py`. Save the three request IDs and the reported model from each turn. On completion or a skipped test, stop the two processes with `kill "$GATEWAY_PID" "$CONNECTOR_PID"`.
 
 ## Record the result
 

@@ -38,3 +38,54 @@ func TestInitChatGPTPilot(t *testing.T) {
 		t.Fatal("existing profile changed")
 	}
 }
+
+func TestCheckChatGPTPilot(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pilot")
+	const key = "test-connector-key"
+	if err := initChatGPTPilot(dir, key); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Error(err)
+		}
+	})
+	want, err := filepath.EvalSymlinks(filepath.Join(dir, "auth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := checkChatGPTPilot(key); err != nil || got != want {
+		t.Fatalf("auth dir %q, err %v", got, err)
+	}
+	for _, name := range []string{"HOME_JWT", "pgstore_dsn", "GITSTORE_GIT_URL", "objectstore_endpoint", "DEPLOY", "writable_path"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "private-value")
+			_, err := checkChatGPTPilot(key)
+			if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "private-value") {
+				t.Fatal("expected a diagnostic identifying only the override name")
+			}
+		})
+	}
+	if err := os.WriteFile(".env", nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkChatGPTPilot(key); err == nil {
+		t.Fatal("accepted .env")
+	}
+	if err := os.Remove(".env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("config.yaml", pilotConfig(wd, key), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkChatGPTPilot(key); err == nil {
+		t.Fatal("accepted foreign auth directory")
+	}
+}
