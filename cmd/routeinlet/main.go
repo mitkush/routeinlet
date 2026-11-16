@@ -162,6 +162,8 @@ func (g gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if control.Flush() != nil {
 		return
 	}
+	var stream terminalEvent
+	complete := false
 	buf := make([]byte, 16*1024)
 	for {
 		n, err := result.Body.Read(buf)
@@ -169,15 +171,21 @@ func (g gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, err := w.Write(buf[:n]); err != nil {
 				return
 			}
+			complete = complete || stream.observe(buf[:n])
 			if control.Flush() != nil {
 				return
 			}
 		}
 		if err != nil {
-			if err != io.EOF {
-				panic(http.ErrAbortHandler)
+			if err == io.EOF && complete {
+				return
 			}
-			return
+			if r.Context().Err() == nil {
+				log.Printf("request %x: interrupted connector stream (terminal event received: %t)", id, complete)
+			}
+			// Headers are committed. Abort the HTTP stream so generic clients
+			// also see an interrupted body, even after receiving partial text.
+			panic(http.ErrAbortHandler)
 		}
 	}
 }

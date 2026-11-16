@@ -80,3 +80,64 @@ func TestRateLimitSingleAttempt(t *testing.T) {
 		t.Fatal(w.Body.String())
 	}
 }
+
+func TestConnectorStreamCompletion(t *testing.T) {
+	const partial = "data: partial text\n\n"
+	for _, tc := range []struct {
+		name, suffix string
+		complete     bool
+	}{
+		{"early EOF", "", false},
+		{"unframed marker", "data: [DONE]\n", false},
+		{"normal", "data: [DONE]\n\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, partial+tc.suffix)
+			}))
+			defer up.Close()
+			app := httptest.NewServer(gateway{up.URL, "pilot", "local", "transport", up.Client()})
+			defer app.Close()
+			res, err := app.Client().Do(makeRequest(context.Background(), app.URL, history))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if res.StatusCode != 200 || string(body) != partial+tc.suffix {
+				t.Fatalf("unexpected committed response: %d %q", res.StatusCode, body)
+			}
+			if tc.complete && err != nil || !tc.complete && err != io.ErrUnexpectedEOF {
+				t.Fatalf("complete=%t, body read error=%v", tc.complete, err)
+			}
+		})
+	}
+}
+
+func TestTerminalEventAcrossReads(t *testing.T) {
+	for _, tc := range []struct {
+		wire string
+		done bool
+	}{
+		{": keepalive\r\ndata:[DONE]\r\n\r\n", true},
+		{"data: [DONE]\r\r", true},
+		{"data: [DONE]\r\n", false},
+		{"data: [DONE]more\n\n", false},
+		{"data: text\ndata: [DONE]\n\n", false},
+		{"data: [DONE]\ndata:\n\n", false},
+		{": data: [DONE]\n\n", false},
+	} {
+		var event terminalEvent
+		done := false
+		for i := range tc.wire {
+			if event.observe([]byte{tc.wire[i]}) {
+				done = true
+				break
+			}
+		}
+		if done != tc.done {
+			t.Errorf("%q: got %t", tc.wire, done)
+		}
+	}
+}
