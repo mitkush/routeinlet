@@ -41,6 +41,16 @@ Maintain a dated evidence record per plan, account tier, client/connector versio
 | Expiry and renewal | Observe renewal or required reauthorization, recovery after restart, and an actionable diagnostic when renewal fails. |
 | Quota and funding | Distinguish exhausted allowance, transient throttling, and unknown causes. Record provider evidence for included or additional charges. Label fixtures separately from live observations. |
 
+### Implementation language and storage
+
+Use **Go** for the RouteInlet CLI, HTTP gateway, routing policy, and accounting. Start with `net/http` for HTTP serving, upstream requests, and streaming, and `context` for cancellation and deadlines. Add dependencies for demonstrated needs. Go supports the intended standalone distribution of the core and lets the team inspect CLIProxyAPI’s Go transport directly.
+
+Use a durable transactional store for spending reservations, notification acknowledgments, dispatch state, and reconciliation. SQLite is the leading candidate for the single-process alpha. Validate concurrent reservations, cancellation after acknowledgment, and restart recovery before selecting the store. Spending correctness depends on explicit request states, transactional updates, and race tests.
+
+Evaluate existing transports independently before rewriting a protocol. Package the Go core as one executable where feasible. Document any external connector process or runtime required by a qualified route. Claim a self-contained installation only after verifying the complete installation on a clean host.
+
+Revisit the working language only if a connector experiment identifies a concrete obstacle. Record the failing case and its impact before proposing a change.
+
 ### Alpha scope and transport selection
 
 Start with one project and one gateway process. Include subscription connections, request preflight, incremental streaming, conversation continuity, request history, and optional notified paid fallback. Defer compression, semantic caching, a large dashboard, distributed replicas, and broad protocol emulation until the baseline passes the release gates.
@@ -222,8 +232,6 @@ Release progression depends on gate evidence. Report simulated quota and crash b
 
 1. **First real application feature.** The provisional recommendation is a streaming text assistant with a multi-turn history check. The product owner will choose the pilot. Document extraction and tool-using applications follow as capability tests.
 2. **Initial setup experience.** The provisional recommendation is local CLI setup. Validate first-run connection and diagnostics with developers before finalizing onboarding. Retain headless and container deployment as platform goals.
-
-Go remains an engineering proposal for the CLI and HTTP service. The runtime and packaging choices remain subject to the transport evaluation.
 
 ## Evidence and launch dependencies
 
