@@ -197,8 +197,14 @@ func localEndpoint(raw string) (string, error) {
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "init-chatgpt-pilot" {
+		if err := initChatGPTPilot(os.Args[2], os.Getenv("ROUTEINLET_CONNECTOR_KEY")); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) != 2 || os.Args[1] != "start" {
-		fmt.Fprintln(os.Stderr, "usage: routeinlet start")
+		fmt.Fprintln(os.Stderr, "usage: routeinlet start | routeinlet init-chatgpt-pilot NEW_DIRECTORY")
 		os.Exit(2)
 	}
 	origin := os.Getenv("ROUTEINLET_CONNECTOR")
