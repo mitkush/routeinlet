@@ -2,6 +2,8 @@
 
 A self-hosted AI subscription gateway. The first milestone is an owner-run Claude Pro connectivity investigation.
 
+To investigate a ChatGPT Plus account, use the [ChatGPT Plus pilot](docs/ChatGPT_Plus_Pilot.md). It uses the same gateway and application fixtures with a separate Codex OAuth connector profile.
+
 ## Run the pilot
 
 This branch implements the loopback HTTP path and a reference application for conversation history and streaming. It requires Go 1.22+ and an independently configured local Claude transport. The probe uses Python 3's standard library. RouteInlet does not log in to Claude, collect Claude tokens, or configure provider billing. A successful stream alone cannot identify the balance that paid for it.

@@ -197,8 +197,22 @@ func localEndpoint(raw string) (string, error) {
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "init-chatgpt-pilot" {
+		if err := initChatGPTPilot(os.Args[2], os.Getenv("ROUTEINLET_CONNECTOR_KEY")); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "check-chatgpt-pilot" {
+		authDir, err := checkChatGPTPilot(os.Getenv("ROUTEINLET_CONNECTOR_KEY"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Verified local file profile, auth directory %s\n", authDir)
+		return
+	}
 	if len(os.Args) != 2 || os.Args[1] != "start" {
-		fmt.Fprintln(os.Stderr, "usage: routeinlet start")
+		fmt.Fprintln(os.Stderr, "usage: routeinlet start | routeinlet init-chatgpt-pilot NEW_DIRECTORY | routeinlet check-chatgpt-pilot")
 		os.Exit(2)
 	}
 	origin := os.Getenv("ROUTEINLET_CONNECTOR")
