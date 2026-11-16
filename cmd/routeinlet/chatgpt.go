@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,15 +51,57 @@ func initChatGPTPilot(dir, localKey string) error {
 		_ = os.Remove(root)
 		return err
 	}
-	// JSON strings are valid quoted YAML scalars, including for Windows paths.
-	key, _ := json.Marshal(localKey)
-	path, _ := json.Marshal(authDir)
 	configPath := filepath.Join(root, "config.yaml")
-	err = os.WriteFile(configPath, []byte(fmt.Sprintf(chatGPTConfig, key, path)), 0600)
+	err = os.WriteFile(configPath, pilotConfig(authDir, localKey), 0600)
 	if err != nil {
 		_ = os.Remove(configPath)
 		_ = os.Remove(authDir)
 		_ = os.Remove(root)
 	}
 	return err
+}
+
+func pilotConfig(authDir, localKey string) []byte {
+	// JSON strings are valid quoted YAML scalars, including for Windows paths.
+	key, _ := json.Marshal(localKey)
+	path, _ := json.Marshal(authDir)
+	return []byte(fmt.Sprintf(chatGPTConfig, key, path))
+}
+
+// Check from the connector's working directory, before login or serving.
+func checkChatGPTPilot(localKey string) (string, error) {
+	for _, entry := range os.Environ() {
+		name, value, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		if value != "" && (upper == "HOME_JWT" || upper == "WRITABLE_PATH" || upper == "DEPLOY" ||
+			strings.HasPrefix(upper, "PGSTORE_") || strings.HasPrefix(upper, "GITSTORE_") || strings.HasPrefix(upper, "OBJECTSTORE_")) {
+			return "", fmt.Errorf("unset connector override %s", name)
+		}
+	}
+	if _, err := os.Lstat(".env"); !os.IsNotExist(err) {
+		return "", errors.New("pilot working directory must be readable and free of .env entries")
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	authDir := filepath.Join(root, "auth")
+	info, err := os.Lstat(authDir)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("pilot auth directory is missing or is not a real directory")
+	}
+	info, err = os.Lstat("config.yaml")
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("pilot config must be a regular file")
+	}
+	config, err := os.ReadFile("config.yaml")
+	if err != nil {
+		return "", err
+	}
+	// Comparing the entire generated config also rejects extra stores, duplicate
+	// YAML keys, managed configuration, or a connection added to the profile.
+	if localKey == "" || !bytes.Equal(config, pilotConfig(authDir, localKey)) {
+		return "", errors.New("config differs from the generated profile for this directory and connector key")
+	}
+	return filepath.EvalSymlinks(authDir)
 }
