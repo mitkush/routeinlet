@@ -61,7 +61,7 @@ func TestPreflight(t *testing.T) {
 		{strings.Replace(history, `"model"`, `"tools":[],"model"`, 1), "tools"},
 		{strings.Replace(history, `"pilot"`, `"other"`, 1), "model"},
 		// Duplicates must not pass whichever value the connector's reader keeps.
-		{strings.Replace(history, `"model"`, `"model":"other","model"`, 1), "model"},
+		{strings.Replace(history, `"model":"pilot"`, `"model":"pilot","model":"other"`, 1), "model"},
 		{strings.Replace(history, `"model"`, `"model":"other","model"`, 1), "model"},
 		{strings.Replace(history, `{"role":"user","content":"A17"}`, `{"role":"tool","role":"user","content":"A17"}`, 1), "messages[1].role"},
 		{strings.Replace(history, `"content":"A17"`, `"content":[{"type":"image_url"}],"content":"A17"`, 1), "messages[1].content"},
@@ -170,7 +170,7 @@ func TestTerminalEventAcrossReads(t *testing.T) {
 		var event terminalEvent
 		done := false
 		for i := range tc.wire {
-			if event.observe([]byte{tc.wire[i]}) {
+			if _, complete := event.observe([]byte{tc.wire[i]}); complete {
 				done = true
 				break
 			}
