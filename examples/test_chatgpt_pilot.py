@@ -50,7 +50,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'{"data": [{"id": "pilot"}]}')
+        self.wfile.write(b'{"data": [{"id": "pilot"}, {"id": "new-model"}]}')
     def do_POST(self):
         (root / 'inference-attempt').touch()
         self.send_error(500)
@@ -84,6 +84,10 @@ HTTPServer(('127.0.0.1', 8318), Handler).serve_forever()
 
     def assert_ports_free(self):
         for port in (8318, 8787):
+            # Binding with SO_REUSEADDR alone misses macOS wildcard listeners.
+            with self.assertRaises(ConnectionRefusedError):
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    pass
             with socket.socket() as listener:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind(("127.0.0.1", port))
@@ -120,11 +124,19 @@ HTTPServer(('127.0.0.1', 8318), Handler).serve_forever()
         self.assertEqual(json.loads(self.command("start", env=changed).stdout)["model"], "new-model")
 
     def test_occupied_port_is_left_alone(self):
+        self.check_occupied_listener("127.0.0.1")
+
+    def test_wildcard_listener_is_left_alone(self):
+        self.check_occupied_listener("0.0.0.0")
+
+    def check_occupied_listener(self, host):
         for port in (8318, 8787):
             with self.subTest(port=port), socket.socket() as listener:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listener.bind(("127.0.0.1", port))
+                listener.bind((host, port))
                 listener.listen()
+                with self.assertRaises(AssertionError):
+                    self.assert_ports_free()
                 result = self.command("start", check=False)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"port {port} is occupied", result.stderr)
@@ -156,6 +168,35 @@ HTTPServer(('127.0.0.1', 8318), Handler).serve_forever()
             with client.makefile("rb") as stream:
                 self.assertEqual(json.loads(stream.readline())["error"], "unauthorized")
         self.assertEqual(json.loads(self.command("status").stdout)["state"], "running")
+
+    def test_unknown_model_fails_start_without_inference(self):
+        result = self.command("start", env=dict(self.env, ROUTEINLET_MODEL="typo"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not listed by the connector", result.stderr)
+        self.assertFalse((self.root / "inference-attempt").exists())
+        self.assert_ports_free()
+
+    def test_malformed_control_state_reports_error_without_stopping(self):
+        initial = json.loads(self.command("start").stdout)
+        path = self.profile / "run/control.json"
+        original = path.read_text()
+        try:
+            for content in ("{", "{}", "[]", '{"port": true, "token": "bad"}',
+                            '{"port": 70000, "token": "bad"}', '{"port": 8318, "token": []}'):
+                with self.subTest(content=content):
+                    path.write_text(content)
+                    result = self.command("status", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Pilot: invalid control state", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            result = self.command("stop", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Pilot: invalid control state", result.stderr)
+        finally:
+            path.write_text(original)
+        status = json.loads(self.command("status").stdout)
+        self.assertEqual(status["gateway_pid"], initial["gateway_pid"])
+        self.assertEqual(status["connector_pid"], initial["connector_pid"])
 
     def test_invalid_profile_starts_no_services(self):
         (self.profile / ".env").touch()

@@ -59,8 +59,15 @@ def control(run, command, fingerprint=None):
     if lock_available(run):
         return None
     try:
-        with open(run / "control.json") as state_file:
-            state = json.load(state_file)
+        try:
+            with open(run / "control.json") as state_file:
+                state = json.load(state_file)
+        except ValueError:
+            raise ValueError("invalid control state; restore a valid run/control.json before using status or stop") from None
+        if (not isinstance(state, dict) or type(state.get("port")) is not int or
+                not 1 <= state["port"] <= 65535 or not isinstance(state.get("token"), str) or
+                len(state["token"]) != 64 or any(c not in "0123456789abcdef" for c in state["token"])):
+            raise ValueError("invalid control state; restore a valid run/control.json before using status or stop")
         with socket.create_connection(("127.0.0.1", state["port"]), timeout=2) as client:
             client.sendall(json.dumps({"command": command, "fingerprint": fingerprint,
                                       "token": state["token"]}).encode() + b"\n")
@@ -81,13 +88,26 @@ def lock_available(run):
 
 def check_ports():
     for port in (8318, 8787):
+        occupied = (f"port {port} is occupied; inspect with lsof -nP -iTCP:{port} -sTCP:LISTEN. "
+                    "No existing process was stopped.")
         with socket.socket() as listener:
+            # Retain reuse to avoid rejecting Linux TIME_WAIT sockets after stop.
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 listener.bind(("127.0.0.1", port))
             except OSError:
-                raise ValueError(f"port {port} is occupied; inspect with lsof -nP -iTCP:{port} -sTCP:LISTEN. "
-                                 "No existing process was stopped.") from None
+                raise ValueError(occupied) from None
+        # On macOS the reusable bind can coexist with a wildcard listener.
+        # A successful connection detects that listener before launching children.
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=1)
+        except ConnectionRefusedError:
+            continue
+        except OSError:
+            raise ValueError(f"could not verify port {port} is free; inspect its listener before starting") from None
+        else:
+            connection.close()
+            raise ValueError(occupied)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -109,6 +129,15 @@ def ready():
         with opener.open(catalog, timeout=1) as response:
             if response.status != 200:
                 return False
+            listing = json.loads(response.read(1 << 20))
+        entries = listing.get("data") if isinstance(listing, dict) else None
+        if not isinstance(entries, list) or not entries:
+            return False  # The connector may still be loading its credentials.
+        models = {entry.get("id") for entry in entries if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
+        if not models:
+            return False
+        if os.environ["ROUTEINLET_MODEL"] not in models:
+            raise RuntimeError("ROUTEINLET_MODEL is not listed by the connector; available IDs: " + ", ".join(sorted(models)[:20]))
         try:
             with opener.open(probe, timeout=1):
                 return False

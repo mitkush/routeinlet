@@ -34,7 +34,7 @@ export ROUTEINLET_KEY="$(openssl rand -hex 32)"
 ./routeinlet init-chatgpt-pilot "$PILOT_DIR"
 ```
 
-On first setup, the command creates a new profile with an empty auth directory, a loopback listener, a single local access key, and zero configured routing and stream-bootstrap retries. It refuses to overwrite an existing profile. Keep its config and auth directory private. To resume a run, reuse the existing connector key and config.
+On first setup, the command creates a new profile with an empty auth directory, a loopback listener, a single local access key, and zero configured routing and stream-bootstrap retries. It refuses to overwrite an existing profile. Keep its config and auth directory private. To resume a run, reuse the existing connector key and config. Older profiles created through a symlinked parent may fail the canonical-path check; preserve the old profile and initialize/login in a new directory using its physical path.
 
 ## Connect the owner account
 
@@ -50,7 +50,7 @@ sh examples/chatgpt-connector.sh login
 
 ## Start, inspect, and stop the pilot
 
-Select the candidate used in the recorded pilot, then start both services with one command. Login must already have succeeded. `start` returns after local readiness checks; it does not send an inference request.
+Select the candidate used in the recorded pilot, then start both services with one command. Login must already have succeeded. `start` returns after local readiness checks, including whether the selected model appears in the connector catalog; it does not send an inference request. Catalog membership alone does not establish inference access.
 
 ```sh
 export ROUTEINLET_MODEL='gpt-6.1-sol'
@@ -80,7 +80,7 @@ python3 examples/chatgpt_pilot.py start
 python3 examples/chatgpt_pilot.py stop
 ```
 
-The launcher holds a profile lock and supervises both children. If either child exits, it shuts down its peer. Stop requests go to a private-token-protected loopback control port; the launcher never sends signals to PIDs read from a stale file. Runtime files and logs are under `$PILOT_DIR/run` with private permissions. Logs may contain connector account details; keep them local.
+The launcher holds a profile lock and supervises both children. If either child exits, it shuts down its peer. Stop requests go to a private-token-protected loopback control port; the launcher never sends signals to PIDs read from a stale file. Runtime files and logs are under `$PILOT_DIR/run` with private permissions. Logs may contain connector account details; keep them local. Logs append across runs without rotation; archive or remove them after stopping the pilot when needed.
 
 ### Existing manual processes
 
