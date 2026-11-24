@@ -2,7 +2,7 @@
 
 A self-hosted AI subscription gateway. The first milestone is an owner-run Claude Pro connectivity investigation.
 
-To investigate a ChatGPT Plus account, use the [ChatGPT Plus pilot](docs/ChatGPT_Plus_Pilot.md). It uses the same gateway and application fixtures with a separate Codex OAuth connector profile.
+To investigate a ChatGPT Plus account, use the [ChatGPT Plus pilot](docs/ChatGPT_Plus_Pilot.md), including its `start`, `status`, and `stop` launcher. It uses the same gateway and application fixtures with a separate Codex OAuth connector profile. The [24 November 2026 pilot report](docs/pilot-results/2026-11-24-chatgpt-plus.md) records successful text inference, recall, and streaming; per-request funding attribution remains unverified.
 
 ## Run the pilot
 
@@ -30,3 +30,15 @@ go build -buildvcs=false -o routeinlet ./cmd/routeinlet
 ## Current boundary
 
 The gateway accepts the streaming text subset (model, stream, messages with system/user/assistant text). It rejects extra fields and duplicate JSON keys before inference, forwards accepted JSON intact, streams the connector's SSE bytes as they arrive, and propagates client cancellation. Requests go to one fixed local connector. Redirects and gateway fallback are disabled. A connector 429 reports an unknown cause. After headers are committed, an upstream close before the blank line completing `data: [DONE]` aborts the downstream HTTP stream. A body reader sees a transport error even if it has already received partial text and HTTP 200. The response ends at that `[DONE]` event even if the connector keeps its connection open. A disconnected stream is never replayed. The gateway always reports funding as unknown in this investigation. Live subscription eligibility, connector-internal transformations and billing attribution are outstanding. See the [product requirements](docs/AI_Subscription_Gateway_PRD.md).
+
+## Automated checks
+
+GitHub Actions runs Go formatting, vet, build, race tests, shell syntax, and Python tests on pull requests and pushes to `main`. The matrix covers Linux with the minimum Go 1.22/Python 3.9 versions, plus Linux and macOS with current stable toolchains. Lifecycle tests build the real gateway and use a local fake connector; they need free loopback ports 8318 and 8787 and do not require provider credentials or send live inference.
+
+To run the same tests locally after stopping the pilot:
+
+```sh
+go test -race ./...
+go vet ./...
+python3 -m unittest discover -s examples -p 'test_*.py' -v
+```
