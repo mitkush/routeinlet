@@ -39,8 +39,11 @@ func problem(w http.ResponseWriter, status int, code, param string) {
 // duplicateKey returns the path of the first repeated object key. Go keeps the
 // last duplicate while other JSON readers may keep the first, so a duplicate
 // could let the connector act on a field preflight never checked.
-func duplicateKey(body []byte) string {
+func duplicateKey(body []byte) (string, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
+	// Values are irrelevant to this scan. Converting numbers to float64 can
+	// overflow and stop traversal before a later duplicate is reached.
+	dec.UseNumber()
 	var walk func(path string) (string, error)
 	walk = func(path string) (string, error) {
 		tok, err := dec.Token()
@@ -79,8 +82,7 @@ func duplicateKey(body []byte) string {
 		}
 		return "", err
 	}
-	dup, _ := walk("")
-	return dup
+	return walk("")
 }
 
 // Keep the original request bytes for dispatch. Decoding is solely for preflight.
@@ -89,7 +91,11 @@ func validate(body []byte, model string) (string, string) {
 	if err := json.Unmarshal(body, &req); err != nil || req == nil {
 		return "invalid_json", ""
 	}
-	if field := duplicateKey(body); field != "" {
+	field, err := duplicateKey(body)
+	if err != nil {
+		return "invalid_json", ""
+	}
+	if field != "" {
 		return "duplicate_field", field
 	}
 	for field := range req {
@@ -217,10 +223,10 @@ func (g gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		n, err := result.Body.Read(buf)
 		if n > 0 {
-			if _, err := w.Write(buf[:n]); err != nil {
+			end, complete := stream.observe(buf[:n])
+			if _, err := w.Write(buf[:end]); err != nil {
 				return
 			}
-			complete := stream.observe(buf[:n])
 			if control.Flush() != nil {
 				return
 			}

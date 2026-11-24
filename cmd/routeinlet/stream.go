@@ -12,8 +12,11 @@ type terminalEvent struct {
 	terminal bool
 }
 
-func (s *terminalEvent) observe(chunk []byte) bool {
-	for _, b := range chunk {
+// observe returns the prefix safe to forward and whether it ends at [DONE].
+// Bytes after the terminating blank line must never reach the client, even
+// when the connector supplies them in the same read.
+func (s *terminalEvent) observe(chunk []byte) (int, bool) {
+	for i, b := range chunk {
 		if b == '\n' && s.afterCR {
 			s.afterCR = false
 			continue
@@ -30,7 +33,13 @@ func (s *terminalEvent) observe(chunk []byte) bool {
 		s.size = 0
 		if len(line) == 0 {
 			if s.terminal {
-				return true
+				end := i + 1
+				// Preserve a complete CRLF already in this chunk. A lone CR
+				// also dispatches the event, so never wait for another read.
+				if b == '\r' && end < len(chunk) && chunk[end] == '\n' {
+					end++
+				}
+				return end, true
 			}
 			s.hasData = false
 		} else if bytes.HasPrefix(line, []byte("data:")) || string(line) == "data" {
@@ -38,5 +47,5 @@ func (s *terminalEvent) observe(chunk []byte) bool {
 			s.hasData = true
 		}
 	}
-	return false
+	return len(chunk), false
 }

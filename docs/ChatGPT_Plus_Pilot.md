@@ -6,7 +6,7 @@ Test one project owner's ChatGPT Plus account through the Codex OAuth transport 
 
 ## Prepare the two processes
 
-Use the RouteInlet PR branch and a CLIProxyAPI executable built from commit `9a8ca1b577ef8573c5ccf108450b93ed57716cc4`. To build the connector from its checkout at that revision, use its Go toolchain and run `go build -o cli-proxy-api ./cmd/server`. The login flag and config layout are revision-specific. [CLI entry point](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/cmd/server/main.go) · [Configuration reference](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/config.example.yaml)
+Use RouteInlet `main` and a CLIProxyAPI executable built from commit `9a8ca1b577ef8573c5ccf108450b93ed57716cc4`. To build the connector from its checkout at that revision, use its Go toolchain and run `go build -o cli-proxy-api ./cmd/server`. The login flag and config layout are revision-specific. [CLI entry point](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/cmd/server/main.go) · [Configuration reference](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/config.example.yaml)
 
 Use a private local directory outside the checkout. The following shell example assumes macOS or Linux and a free gateway port 8787 and connector port 8318. Stop the previous gateway before switching pilots. Run the commands from the RouteInlet checkout in the same shell.
 
@@ -68,3 +68,15 @@ After satisfying the condition above, run `python3 examples/probe.py`. Save the 
 | Quota and renewal | On a naturally observed limit or credential expiry, record the provider signal, gateway error, and recovery on a fresh request. A generic 429 leaves the quota cause unknown. |
 
 Exclude access keys, OAuth files, account identifiers, and raw authorization headers from shared results. A completed local pilot establishes only the tested account, model, workload, and environment.
+
+## Sign in with ChatGPT follow-up
+
+The launcher currently uses `-codex-login`; it does not enable SIWC. The pinned connector includes `-siwc-bind` and starts registration with `client_id=dynamic_agent_client`. OpenAI issues the application client ID during that flow, so obtaining a separate client ID in advance is not a prerequisite for the documented local registration path. [Pinned SIWC implementation](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/internal/auth/codex/siwc_auth.go) · [Binding command](https://github.com/router-for-me/CLIProxyAPI/blob/9a8ca1b577ef8573c5ccf108450b93ed57716cc4/internal/cmd/siwc_bind.go)
+
+Before adding SIWC to this pilot:
+
+- Resolve identity verification in the connector. The inspected token-exchange and binding path checks for an ID token but does not verify its signature, issuer, audience, and nonce. OpenAI's [integration guide](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt) requires those checks before saving the profile. Add rejection tests for invalid tokens and mismatched claims when choosing or updating the connector revision.
+- Verify that the issued client registration is retained and that the grant includes `chatgpt.tokens.use.direct`. A completed identity login alone does not establish permission to use plan allowance.
+- Repeat the isolated owner-account pilot with the funding checks above. Record consent, actual inference, attempt counts, expiry/refresh behavior, and account-side allowance evidence. Keep these results pending until observed.
+
+SIWC availability in the dependency is not evidence that this RouteInlet pilot has completed that flow or established included-allowance funding.
