@@ -36,11 +36,61 @@ func problem(w http.ResponseWriter, status int, code, param string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "param": param}})
 }
 
+// duplicateKey returns the path of the first repeated object key. Go keeps the
+// last duplicate while other JSON readers may keep the first, so a duplicate
+// could let the connector act on a field preflight never checked.
+func duplicateKey(body []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	var walk func(path string) (string, error)
+	walk = func(path string) (string, error) {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		switch tok {
+		case json.Delim('{'):
+			seen := map[string]bool{}
+			for dec.More() {
+				key, err := dec.Token()
+				if err != nil {
+					return "", err
+				}
+				name := key.(string)
+				field := name
+				if path != "" {
+					field = path + "." + name
+				}
+				if seen[name] {
+					return field, nil
+				}
+				seen[name] = true
+				if dup, err := walk(field); dup != "" || err != nil {
+					return dup, err
+				}
+			}
+			_, err = dec.Token()
+		case json.Delim('['):
+			for i := 0; dec.More(); i++ {
+				if dup, err := walk(fmt.Sprintf("%s[%d]", path, i)); dup != "" || err != nil {
+					return dup, err
+				}
+			}
+			_, err = dec.Token()
+		}
+		return "", err
+	}
+	dup, _ := walk("")
+	return dup
+}
+
 // Keep the original request bytes for dispatch. Decoding is solely for preflight.
 func validate(body []byte, model string) (string, string) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil || req == nil {
 		return "invalid_json", ""
+	}
+	if field := duplicateKey(body); field != "" {
+		return "duplicate_field", field
 	}
 	for field := range req {
 		switch field {
@@ -163,7 +213,6 @@ func (g gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stream terminalEvent
-	complete := false
 	buf := make([]byte, 16*1024)
 	for {
 		n, err := result.Body.Read(buf)
@@ -171,17 +220,19 @@ func (g gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, err := w.Write(buf[:n]); err != nil {
 				return
 			}
-			complete = complete || stream.observe(buf[:n])
+			complete := stream.observe(buf[:n])
 			if control.Flush() != nil {
+				return
+			}
+			// End the response at [DONE]. A connector that holds the connection
+			// open afterwards must not delay the client or turn into an abort.
+			if complete {
 				return
 			}
 		}
 		if err != nil {
-			if err == io.EOF && complete {
-				return
-			}
 			if r.Context().Err() == nil {
-				log.Printf("request %x: interrupted connector stream (terminal event received: %t)", id, complete)
+				log.Printf("request %x: connector stream ended before [DONE]", id)
 			}
 			// Headers are committed. Abort the HTTP stream so generic clients
 			// also see an interrupted body, even after receiving partial text.

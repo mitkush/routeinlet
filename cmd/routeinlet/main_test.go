@@ -60,6 +60,11 @@ func TestPreflight(t *testing.T) {
 		{strings.Replace(history, `"remember"`, `[{"type":"image"}]`, 1), "messages[0].content"},
 		{strings.Replace(history, `"model"`, `"tools":[],"model"`, 1), "tools"},
 		{strings.Replace(history, `"pilot"`, `"other"`, 1), "model"},
+		// Duplicates must not pass whichever value the connector's reader keeps.
+		{strings.Replace(history, `"model"`, `"model":"other","model"`, 1), "model"},
+		{strings.Replace(history, `"model"`, `"model":"other","model"`, 1), "model"},
+		{strings.Replace(history, `{"role":"user","content":"A17"}`, `{"role":"tool","role":"user","content":"A17"}`, 1), "messages[1].role"},
+		{strings.Replace(history, `"content":"A17"`, `"content":[{"type":"image_url"}],"content":"A17"`, 1), "messages[1].content"},
 	} {
 		w := httptest.NewRecorder()
 		g := gateway{model: "pilot", key: "local"}
@@ -112,6 +117,40 @@ func TestConnectorStreamCompletion(t *testing.T) {
 				t.Fatalf("complete=%t, body read error=%v", tc.complete, err)
 			}
 		})
+	}
+}
+
+func TestCompletionWithoutUpstreamClose(t *testing.T) {
+	const wire = "data: text\n\ndata: [DONE]\n\n"
+	released := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, wire)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(released)
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer up.Close()
+	app := httptest.NewServer(gateway{up.URL, "pilot", "local", "transport", up.Client()})
+	defer app.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res, err := app.Client().Do(makeRequest(ctx, app.URL, history))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil || string(body) != wire {
+		t.Fatalf("completed stream not delivered cleanly: %q, %v", body, err)
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("gateway kept the connector request open after [DONE]")
 	}
 }
 
