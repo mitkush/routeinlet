@@ -21,7 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Python 3.9 has no distribution for Ubuntu 26.04 (ubuntu-latest).
+          - os: ubuntu-22.04
             go: '1.22.x'
             python: '3.9'
           - os: ubuntu-latest

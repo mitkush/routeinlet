@@ -46,6 +46,14 @@ func initChatGPTPilot(dir, localKey string) error {
 	if err := os.Mkdir(root, 0700); err != nil {
 		return fmt.Errorf("create new pilot directory: %w", err)
 	}
+	// macOS commonly exposes /var and /tmp through symlinked parents. Store
+	// the physical path so checking from either spelling produces the same config.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		_ = os.Remove(root)
+		return err
+	}
+	root = resolvedRoot
 	authDir := filepath.Join(root, "auth")
 	if err := os.Mkdir(authDir, 0700); err != nil {
 		_ = os.Remove(root)
@@ -82,6 +90,10 @@ func checkChatGPTPilot(localKey string) (string, error) {
 		return "", errors.New("pilot working directory must be readable and free of .env entries")
 	}
 	root, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", err
 	}
