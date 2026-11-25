@@ -271,7 +271,7 @@ diff --git a/internal/auth/codex/siwc_id_token.go b/internal/auth/codex/siwc_id_
 new file mode 100644
 --- /dev/null
 +++ b/internal/auth/codex/siwc_id_token.go
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,87 @@
 +package codex
 +
 +import (
@@ -309,23 +309,28 @@ new file mode 100644
 +// verifySIWCIDToken is called only for authorization-code grants. Refresh does
 +// not have a new authorization nonce and must retain its rotation/journal rules.
 +func (o *CodexAuth) verifySIWCIDToken(ctx context.Context, tokens *CodexSIWCTokenData, expectedNonce string) error {
++	return o.verifySIWCIDTokenWithClock(ctx, tokens, expectedNonce, time.Now)
++}
++
++func (o *CodexAuth) verifySIWCIDTokenWithClock(ctx context.Context, tokens *CodexSIWCTokenData, expectedNonce string, nowFunc func() time.Time) error {
 +	// Verification errors can contain token claims or JWKS response bodies.
 +	// Return a fixed error so callers cannot accidentally log those values.
 +	invalid := errors.New("SIWC ID token verification failed; start a new sign-in")
-+	if o == nil || o.siwcKeySet == nil || tokens == nil || strings.TrimSpace(expectedNonce) == "" {
++	if o == nil || o.siwcKeySet == nil || tokens == nil || strings.TrimSpace(expectedNonce) == "" || ctx.Err() != nil {
 +		return invalid
 +	}
-+	now := time.Now()
 +	verifier := oidc.NewVerifier(siwcIssuer, o.siwcKeySet, &oidc.Config{
 +		ClientID:             tokens.ClientID,
 +		SupportedSigningAlgs: []string{oidc.RS256},
-+		Now:                  func() time.Time { return now },
++		Now:                  nowFunc,
 +	})
 +	identity, errVerify := verifier.Verify(ctx, tokens.IDToken)
-+	if errVerify != nil {
++	if errVerify != nil || ctx.Err() != nil {
 +		return invalid
 +	}
-+	if strings.TrimSpace(identity.Subject) == "" ||
++	now := nowFunc()
++	if !identity.Expiry.After(now) ||
++		strings.TrimSpace(identity.Subject) == "" ||
 +		identity.IssuedAt.IsZero() ||
 +		identity.IssuedAt.After(now.Add(5*time.Second)) ||
 +		!identity.Expiry.After(identity.IssuedAt) ||
@@ -358,7 +363,7 @@ diff --git a/internal/auth/codex/siwc_id_token_test.go b/internal/auth/codex/siw
 new file mode 100644
 --- /dev/null
 +++ b/internal/auth/codex/siwc_id_token_test.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,245 @@
 +package codex
 +
 +import (
@@ -542,16 +547,16 @@ new file mode 100644
 +	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify != nil || requests.Load() != 2 {
 +		t.Fatalf("key rotation failed: %v", errVerify)
 +	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if errVerify := auth.verifySIWCIDToken(ctx, token, "nonce"); errVerify == nil {
++		t.Fatal("cancelled verification accepted")
++	}
 +	// A new verifier has no cached key; malformed JWKS must fail closed.
 +	keys.Store("not-json")
 +	auth.siwcKeySet = newSIWCKeySet(client)
 +	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify == nil {
 +		t.Fatal("malformed JWKS accepted")
-+	}
-+	ctx, cancel := context.WithCancel(context.Background())
-+	cancel()
-+	if errVerify := auth.verifySIWCIDToken(ctx, token, "nonce"); errVerify == nil {
-+		t.Fatal("cancelled verification accepted")
 +	}
 +}
 +
@@ -573,6 +578,35 @@ new file mode 100644
 +	token := &CodexSIWCTokenData{ClientID: "oaiapp_test", IDToken: siwctest.Token(t, key, "key", "oaiapp_test", "nonce", nil)}
 +	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify == nil || redirected.Load() != 0 {
 +		t.Fatal("redirected JWKS accepted or contacted")
++	}
++}
++
++type siwcTestKeySet func(context.Context, string) ([]byte, error)
++
++func (f siwcTestKeySet) VerifySignature(ctx context.Context, token string) ([]byte, error) {
++	return f(ctx, token)
++}
++
++func TestSIWCExpiryCheckedAfterKeyFetch(t *testing.T) {
++	key := siwctest.NewKey(t)
++	clock := time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
++	start := clock
++	token := &CodexSIWCTokenData{ClientID: "oaiapp_test", IDToken: siwctest.Token(t, key, "key", "oaiapp_test", "nonce", func(doc *ojson.Doc) {
++		if errSet := doc.Set("iat", start.Unix()); errSet != nil {
++			t.Fatal(errSet)
++		}
++		if errSet := doc.Set("exp", start.Add(time.Minute).Unix()); errSet != nil {
++			t.Fatal(errSet)
++		}
++	})}
++	keys := &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}
++	auth := &CodexAuth{siwcKeySet: siwcTestKeySet(func(ctx context.Context, raw string) ([]byte, error) {
++		// Model time passing during key retrieval without sleeping.
++		clock = clock.Add(2 * time.Minute)
++		return keys.VerifySignature(ctx, raw)
++	})}
++	if errVerify := auth.verifySIWCIDTokenWithClock(context.Background(), token, "nonce", func() time.Time { return clock }); errVerify == nil {
++		t.Fatal("token that expired during key retrieval was accepted")
 +	}
 +}
 diff --git a/internal/auth/codex/siwc_renewal_test.go b/internal/auth/codex/siwc_renewal_test.go
