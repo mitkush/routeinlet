@@ -47,21 +47,7 @@ jobs:
         run: |
           git worktree add --detach "$RUNNER_TEMP/siwc-baseline" 9a8ca1b577ef8573c5ccf108450b93ed57716cc4
           cd "$RUNNER_TEMP/siwc-baseline"
-          if go test -race ./internal/api/handlers/management -run '^TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders
-        working-directory: ${{ runner.temp }}/siwc-connector
-        run: |
-          go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management
-          go build -o test-output ./cmd/server
-          rm test-output
-          go test -race ./internal/auth/codex ./internal/cmd -count=1 -timeout=15m
-          # The full management suite has an upstream xAI fixture cleanup race.
-          # Race-check all SIWC cases; the full suite still runs below without -race.
-          go test -race ./internal/api/handlers/management -run SIWC -count=1 -timeout=15m
-      - name: Test connector suite
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: ${{ runner.temp }}/siwc-connector
-        run: go test ./... -count=1 -timeout=15m
- -count=10 > "$RUNNER_TEMP/siwc-baseline.log" 2>&1; then
+          if go test -race ./internal/api/handlers/management -run '^TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders$' -count=10 > "$RUNNER_TEMP/siwc-baseline.log" 2>&1; then
             cat "$RUNNER_TEMP/siwc-baseline.log"
             echo "The intermittent upstream cleanup race did not reproduce in this run."
           else
@@ -77,7 +63,10 @@ jobs:
           go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management
           go build -o test-output ./cmd/server
           rm test-output
-          go test -race ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management -count=1 -timeout=15m
+          go test -race ./internal/auth/codex ./internal/cmd -count=1 -timeout=15m
+          # The full management suite has an upstream xAI fixture cleanup race.
+          # Race-check all SIWC cases; the full suite still runs below without -race.
+          go test -race ./internal/api/handlers/management -run SIWC -count=1 -timeout=15m
       - name: Test connector suite
         if: matrix.os == 'ubuntu-latest'
         working-directory: ${{ runner.temp }}/siwc-connector
