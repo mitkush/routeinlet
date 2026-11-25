@@ -43,7 +43,8 @@ sh scripts/prepare-siwc-connector.sh "$HOME/routeinlet-siwc-review"
 (
   cd "$HOME/routeinlet-siwc-review" &&
   go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management &&
-  go test -race ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management -count=1 &&
+  go test -race ./internal/auth/codex ./internal/cmd -count=1 &&
+  go test -race ./internal/api/handlers/management -run SIWC -count=1 &&
   go test ./... -count=1 &&
   go build -o cli-proxy-api ./cmd/server
 )
@@ -54,8 +55,15 @@ patch, resolves the two fixed dependency versions, verifies module checksums,
 and formats the applied Go files. It refuses to touch an existing directory.
 Go produces the checkout's `go.mod`/`go.sum` changes; retain those with any
 resulting binary for provenance. The script does not start a service, sign in,
-or run inference. CI runs the affected packages with the race detector on Linux
-and macOS, builds the server, and runs the full connector suite on Linux.
+or run inference. CI race-tests the Codex auth and CLI packages plus all SIWC management cases
+on Linux and macOS, builds the server, and runs the full connector suite on Linux.
+
+The full management package's race run exposed an existing xAI fixture cleanup
+race in `TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders`:
+its cleanup restores `http.DefaultTransport` while a device-flow goroutine
+still reads it. CI runs that test against the unpatched pin as a separate
+comparison. This PR does not claim a passing race run for the entire upstream
+management package; it retains all management tests in the ordinary full suite.
 
 ## Qualification boundary
 
