@@ -57,6 +57,17 @@ jobs:
             grep -q -- '--- FAIL: TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders' "$RUNNER_TEMP/siwc-baseline.log"
             echo "::warning::Unpatched connector reproduces the unrelated management test cleanup race."
           fi
+      - name: Compare upstream byte-write review entry
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: ${{ runner.temp }}/siwc-baseline
+        run: |
+          if go test ./internal/util -run '^TestInPlaceByteWritesAreReviewed$' -count=1 > "$RUNNER_TEMP/siwc-invariant-baseline.log" 2>&1; then
+            cat "$RUNNER_TEMP/siwc-invariant-baseline.log"
+          else
+            cat "$RUNNER_TEMP/siwc-invariant-baseline.log"
+            grep -q 'unreviewed in-place byte write in sdk/cliproxy/auth/selector_weighted.go' "$RUNNER_TEMP/siwc-invariant-baseline.log"
+            echo "::notice::Unpatched connector is missing the scheduler struct-copy review entry."
+          fi
       - name: Vet, build, and race-test SIWC paths
         working-directory: ${{ runner.temp }}/siwc-connector
         run: |

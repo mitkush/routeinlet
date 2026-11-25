@@ -12,6 +12,13 @@ returns the credentials without verifying the ID token. This patch makes the
 authorization-code exchange return credentials only after verification.
 Both CLI binding and v8 management binding pass the pending attempt's nonce.
 
+The small second patch updates the upstream byte-write test's review table.
+Its scanner also matches two `copy` calls on `[]weightedPoolMember`: these
+move struct values (string headers and numbers), without rewriting any JSON
+payload bytes. The entry records exactly two operations and that justification;
+the invariant test remains enabled. CI checks the missing entry against the
+unpatched pin before running the patched full suite.
+
 ## Verification
 
 - Use `coreos/go-oidc/v3 v3.16.0` and `go-jose/v4 v4.1.3`.
@@ -51,7 +58,7 @@ sh scripts/prepare-siwc-connector.sh "$HOME/routeinlet-siwc-review"
 ```
 
 The preparation script fetches exactly the pinned commit, checks and applies the
-patch, resolves the two fixed dependency versions, verifies module checksums,
+patches, resolves the two fixed dependency versions, verifies module checksums,
 and formats the applied Go files. It refuses to touch an existing directory.
 Go produces the checkout's `go.mod`/`go.sum` changes; retain those with any
 resulting binary for provenance. The script does not start a service, sign in,
