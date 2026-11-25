@@ -89,3 +89,40 @@ func TestCheckChatGPTPilot(t *testing.T) {
 		t.Fatal("accepted foreign auth directory")
 	}
 }
+
+func TestPilotProfileThroughSymlinkedParent(t *testing.T) {
+	parent := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(parent, alias); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(alias, "pilot")
+	const key = "connector-key"
+	if err := initChatGPTPilot(dir, key); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, path := range []string{dir, physical} {
+		t.Run(path, func(t *testing.T) {
+			if err := os.Chdir(path); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PWD", path)
+			if got, err := checkChatGPTPilot(key); err != nil || got != filepath.Join(physical, "auth") {
+				t.Fatalf("auth dir %q, err %v", got, err)
+			}
+		})
+	}
+}
