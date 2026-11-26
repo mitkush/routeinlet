@@ -24,6 +24,19 @@ identity, and saves the host ID before browser authorization. See
 [Account binding and migration](Account_Binding.md) for the exact first-binding
 requirements and remaining live-qualification limits.
 
+The fourth patch only changes upstream WebSocket test fixtures. A successful
+HTTP upgrade can precede peer registration, so server fixtures now await a
+control response before other peers inspect discovery. The idle-writer protocol
+error case waits for the initial writer to release its lock. Backpressure uses
+the existing gated transport to block one write, fill exactly two queue slots,
+and check both the rejection and healthy-peer delivery; it then releases and
+checks the accepted slow-peer frames. This replaces a socket flood and an
+unbounded barrier wait that could hang when the sender's control queue filled.
+No WebSocket production behavior or assertions are disabled. CI repeats the
+four affected tests under the race detector on Linux and macOS. The full Linux
+suite runs with `-p 1` to avoid competing package builds/tests during upstream
+20ms timing assertions; those thresholds remain unchanged.
+
 ## Verification
 
 - Use `coreos/go-oidc/v3 v3.16.0` and `go-jose/v4 v4.1.3`.
@@ -58,7 +71,7 @@ sh scripts/prepare-siwc-connector.sh "$HOME/routeinlet-siwc-review"
   go test -race ./internal/auth/codex ./internal/cmd -count=1 &&
   go test -race ./internal/api/handlers/management -run SIWC -count=1 &&
   go test -race ./sdk/cliproxy/auth -run '^TestBindCodexSIWC' -count=1 &&
-  go test ./... -count=1 &&
+  go test -p 1 ./... -count=1 -timeout=15m &&
   go build -o cli-proxy-api ./cmd/server
 )
 ```
