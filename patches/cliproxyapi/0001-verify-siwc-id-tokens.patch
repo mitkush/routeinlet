@@ -1,0 +1,831 @@
+diff --git a/internal/api/handlers/management/oauth_siwc.go b/internal/api/handlers/management/oauth_siwc.go
+--- a/internal/api/handlers/management/oauth_siwc.go
++++ b/internal/api/handlers/management/oauth_siwc.go
+@@ -26,7 +26,7 @@
+ 
+ type siwcOAuthService interface {
+ 	GenerateSIWCAuthURL(state, nonce, deviceID, redirectURI string, pkce *codex.PKCECodes) (string, error)
+-	ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirectURI, deviceID string, pkce *codex.PKCECodes) (*codex.CodexSIWCTokenData, error)
++	ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirectURI, deviceID string, pkce *codex.PKCECodes, expectedNonce string) (*codex.CodexSIWCTokenData, error)
+ }
+ 
+ // siwcBindSession is server-owned: callbacks cannot select a different target,
+@@ -43,6 +43,7 @@
+ 	authDir      string
+ 	deviceID     string
+ 	redirect     string
++	nonce        string
+ 	pkce         *codex.PKCECodes
+ 	ctx          context.Context
+ 	cancel       context.CancelFunc
+@@ -265,7 +266,7 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(PopulateAuthContext(context.Background(), c), siwcBindTTL)
+ 	flow := &siwcBindSession{owner: h, manager: manager, service: service, targetID: target.ID, epoch: target.RegistrationEpoch,
+-		accountID: accountID, path: path, authDir: cfg.AuthDir, deviceID: deviceID, redirect: codex.SIWCRedirectURI, pkce: pkce, ctx: ctx, cancel: cancel}
++		accountID: accountID, path: path, authDir: cfg.AuthDir, deviceID: deviceID, redirect: codex.SIWCRedirectURI, nonce: nonce, pkce: pkce, ctx: ctx, cancel: cancel}
+ 	if !oauthSessions.registerSIWC(state, flow) {
+ 		cancel()
+ 		c.JSON(http.StatusConflict, gin.H{"error": "a SIWC binding is already pending for this credential"})
+@@ -422,7 +423,7 @@
+ 	flow.mu.Lock()
+ 	pkce := flow.pkce
+ 	flow.mu.Unlock()
+-	tokenData, errExchange := flow.service.ExchangeSIWCCodeForTokens(flow.ctx, code, clientID, flow.redirect, flow.deviceID, pkce)
++	tokenData, errExchange := flow.service.ExchangeSIWCCodeForTokens(flow.ctx, code, clientID, flow.redirect, flow.deviceID, pkce, flow.nonce)
+ 	flow.mu.Lock()
+ 	flow.owner.siwcCommitMu.Lock()
+ 	var persisted *coreauth.Auth
+diff --git a/internal/api/handlers/management/oauth_siwc_test.go b/internal/api/handlers/management/oauth_siwc_test.go
+--- a/internal/api/handlers/management/oauth_siwc_test.go
++++ b/internal/api/handlers/management/oauth_siwc_test.go
+@@ -23,7 +23,7 @@
+ )
+ 
+ type siwcExchangeInput struct {
+-	code, clientID, redirect, deviceID string
++	code, clientID, redirect, deviceID, nonce string
+ 	pkce                               *codex.PKCECodes
+ }
+ 
+@@ -38,9 +38,9 @@
+ 	return codex.NewCodexAuth(nil).GenerateSIWCAuthURL(state, nonce, deviceID, redirect, pkce)
+ }
+ 
+-func (s *testSIWCOAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirect, deviceID string, pkce *codex.PKCECodes) (*codex.CodexSIWCTokenData, error) {
++func (s *testSIWCOAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirect, deviceID string, pkce *codex.PKCECodes, expectedNonce string) (*codex.CodexSIWCTokenData, error) {
+ 	s.calls.Add(1)
+-	s.inputs <- siwcExchangeInput{code, clientID, redirect, deviceID, pkce}
++	s.inputs <- siwcExchangeInput{code, clientID, redirect, deviceID, expectedNonce, pkce}
+ 	if s.release != nil {
+ 		// Deliberately ignore cancellation to prove the commit gate rejects a
+ 		// successful but late upstream result after cancellation or expiration.
+@@ -165,6 +165,9 @@
+ 	if !ok || session.SIWC == nil {
+ 		t.Fatal("missing SIWC session")
+ 	}
++	if session.SIWC.nonce != q.Get("nonce") {
++		t.Fatal("pending session lost authorization nonce")
++	}
+ 	if strings.Contains(w.Body.String(), session.SIWC.pkce.CodeVerifier) {
+ 		t.Fatal("PKCE verifier exposed")
+ 	}
+@@ -209,6 +212,9 @@
+ 			}
+ 			waitSIWCExchange(t, flow)
+ 			input := <-f.service.inputs
++			if input.nonce == "" || input.nonce != flow.nonce {
++				t.Fatal("exchange did not receive the server-owned nonce")
++			}
+ 			if input.clientID != "oaiapp_issued" || input.code != "issued-code" || input.redirect != codex.SIWCRedirectURI || input.deviceID != "e61bbe28-07ef-466d-8e5d-a344f94ab305" || input.pkce == nil {
+ 				t.Fatal("exchange lost server context or dynamic client_id")
+ 			}
+diff --git a/internal/api/handlers/management/oauth_siwc_verification_test.go b/internal/api/handlers/management/oauth_siwc_verification_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/api/handlers/management/oauth_siwc_verification_test.go
+@@ -0,0 +1,99 @@
++package management
++
++import (
++	"errors"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/MoeForge/moego/ojson"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/siwctest"
++)
++
++type siwcVerificationTransport func(*http.Request) (*http.Response, error)
++
++func (f siwcVerificationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	return f(req)
++}
++
++func TestSIWCManagementVerifiesBeforeSaving(t *testing.T) {
++	for _, mode := range []string{"valid", "signature", "nonce", "issuer", "audience"} {
++		t.Run(mode, func(t *testing.T) {
++			key, otherKey := siwctest.NewKey(t), siwctest.NewKey(t)
++			var idToken atomic.Value
++			var exchanges atomic.Int32
++			previousTransport := http.DefaultTransport
++			t.Cleanup(func() { http.DefaultTransport = previousTransport })
++			http.DefaultTransport = siwcVerificationTransport(func(req *http.Request) (*http.Response, error) {
++				var body string
++				switch req.URL.String() {
++				case codex.SIWCTokenURL:
++					exchanges.Add(1)
++					body = siwctest.Response(t, idToken.Load().(string))
++				case "https://auth.openai.com/.well-known/jwks.json":
++					body = siwctest.JWKS(t, key, "test-key")
++				default:
++					return nil, errors.New("unexpected network request")
++				}
++				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
++			})
++			f := setupSIWCFlow(t, false)
++			f.h.siwcOAuthFactory = func(cfg *config.Config) siwcOAuthService {
++				return codex.NewCodexAuth(cfg)
++			}
++			beforeDisk, errRead := os.ReadFile(f.path)
++			if errRead != nil {
++				t.Fatal(errRead)
++			}
++			beforeMemory, _ := f.manager.GetByID(f.auth.ID)
++			beforeDoc := ojson.NewDocString("{}")
++			if errSet := beforeDoc.Set("metadata", beforeMemory.Metadata); errSet != nil {
++				t.Fatal(errSet)
++			}
++			state, flow := f.start(t)
++			signingKey := key
++			if mode == "signature" {
++				signingKey = otherKey
++			}
++			idToken.Store(siwctest.Token(t, signingKey, "test-key", "oaiapp_issued", flow.nonce, func(doc *ojson.Doc) {
++				field := map[string]string{"nonce": "nonce", "issuer": "iss", "audience": "aud"}[mode]
++				if field != "" {
++					if errSet := doc.Set(field, "wrong-value"); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++			}))
++			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"redirect_url": siwcCallbackURL(state)})
++			if w.Code != http.StatusOK {
++				t.Fatalf("callback status %d", w.Code)
++			}
++			waitSIWCExchange(t, flow)
++			if exchanges.Load() != 1 {
++				t.Fatal("unexpected token exchange count")
++			}
++			afterDisk, errRead := os.ReadFile(f.path)
++			if errRead != nil {
++				t.Fatal(errRead)
++			}
++			afterMemory, _ := f.manager.GetByID(f.auth.ID)
++			afterDoc := ojson.NewDocString("{}")
++			if errSet := afterDoc.Set("metadata", afterMemory.Metadata); errSet != nil {
++				t.Fatal(errSet)
++			}
++			status := performOAuthStatusRequest(t, f.router, state)
++			if mode == "valid" {
++				if status.Status != "ok" || afterMemory.Metadata["use_siwc"] != true ||
++					ojson.GetBytes(afterDisk, "siwc.refresh_token").String() != "new-refresh" {
++					t.Fatal("verified credentials not saved")
++				}
++			} else if status.Status != "error" || string(afterDisk) != string(beforeDisk) || beforeDoc.String() != afterDoc.String() {
++				t.Fatal("rejected ID token changed disk or live credentials")
++			}
++		})
++	}
++}
+diff --git a/internal/auth/codex/openai_auth.go b/internal/auth/codex/openai_auth.go
+--- a/internal/auth/codex/openai_auth.go
++++ b/internal/auth/codex/openai_auth.go
+@@ -38,6 +38,7 @@
+ 	httpClient        *http.Client
+ 	siwcAgentNameHint string
+ 	refreshJournal    RefreshJournal
++	siwcKeySet        siwcSignatureKeySet
+ }
+ 
+ var codexRefreshGroup singleflight.Group
+@@ -66,8 +67,10 @@
+ 	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+ 		journal = &FileRefreshJournal{Dir: cfg.AuthDir}
+ 	}
++	client := util.SetProxy(&sdkCfg, &http.Client{})
+ 	return &CodexAuth{
+-		httpClient:        util.SetProxy(&sdkCfg, &http.Client{}),
++		httpClient:        client,
++		siwcKeySet:        newSIWCKeySet(client),
+ 		siwcAgentNameHint: agentNameHint,
+ 		refreshJournal:    journal,
+ 	}
+diff --git a/internal/auth/codex/siwc_auth.go b/internal/auth/codex/siwc_auth.go
+--- a/internal/auth/codex/siwc_auth.go
++++ b/internal/auth/codex/siwc_auth.go
+@@ -249,12 +249,15 @@
+ }
+ 
+ // ExchangeSIWCCodeForTokens exchanges a Sign in with ChatGPT authorization code for tokens.
+-func (o *CodexAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, issuedClientID, redirectURI, deviceID string, pkceCodes *PKCECodes) (*CodexSIWCTokenData, error) {
++func (o *CodexAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, issuedClientID, redirectURI, deviceID string, pkceCodes *PKCECodes, expectedNonce string) (*CodexSIWCTokenData, error) {
+ 	if pkceCodes == nil {
+ 		return nil, fmt.Errorf("PKCE codes are required for SIWC token exchange")
+ 	}
++	if strings.TrimSpace(expectedNonce) == "" {
++		return nil, fmt.Errorf("SIWC token exchange requires the pending authorization nonce")
++	}
+ 	issuedClientID = strings.TrimSpace(issuedClientID)
+-	if issuedClientID == "" {
++	if issuedClientID == "" || issuedClientID == SIWCDynamicClientID {
+ 		return nil, fmt.Errorf("OpenAI OAuth registration callback did not contain an issued client ID")
+ 	}
+ 	code = strings.TrimSpace(code)
+@@ -273,7 +276,14 @@
+ 		"redirect_uri":  {strings.TrimSpace(redirectURI)},
+ 		"resource":      {SIWCResource},
+ 	}
+-	return o.requestSIWCToken(ctx, form, issuedClientID, deviceID, true)
++	tokens, errExchange := o.requestSIWCToken(ctx, form, issuedClientID, deviceID, true)
++	if errExchange != nil {
++		return nil, errExchange
++	}
++	if errVerify := o.verifySIWCIDToken(ctx, tokens, expectedNonce); errVerify != nil {
++		return nil, errVerify
++	}
++	return tokens, nil
+ }
+ 
+ // SIWCRefreshError marks an error as originating from a Sign in with ChatGPT (SIWC) token refresh.
+diff --git a/internal/auth/codex/siwc_auth_test.go b/internal/auth/codex/siwc_auth_test.go
+--- a/internal/auth/codex/siwc_auth_test.go
++++ b/internal/auth/codex/siwc_auth_test.go
+@@ -146,8 +146,9 @@
+ 		"scope":         SIWCScope,
+ 	}
+ 
++	responseBody["id_token"] = testSIWCIDToken(t, auth, "oaiapp_client1")
+ 	before := time.Now()
+-	tokenData, err := auth.ExchangeSIWCCodeForTokens(context.Background(), "code-xyz", "oaiapp_client1", SIWCRedirectURI, deviceID, pkce)
++	tokenData, err := auth.ExchangeSIWCCodeForTokens(context.Background(), "code-xyz", "oaiapp_client1", SIWCRedirectURI, deviceID, pkce, "test-nonce")
+ 	if err != nil {
+ 		t.Fatalf("ExchangeSIWCCodeForTokens error: %v", err)
+ 	}
+@@ -187,7 +188,7 @@
+ 		"expires_in":    3600,
+ 		"scope":         "openid profile email offline_access resource.invoke",
+ 	}
+-	if _, errScope := auth.ExchangeSIWCCodeForTokens(context.Background(), "code-xyz", "oaiapp_client1", SIWCRedirectURI, deviceID, pkce); errScope == nil {
++	if _, errScope := auth.ExchangeSIWCCodeForTokens(context.Background(), "code-xyz", "oaiapp_client1", SIWCRedirectURI, deviceID, pkce, "test-nonce"); errScope == nil {
+ 		t.Fatal("expected error when chatgpt.tokens.use.direct scope is missing")
+ 	}
+ 
+diff --git a/internal/auth/codex/siwc_id_token.go b/internal/auth/codex/siwc_id_token.go
+new file mode 100644
+--- /dev/null
++++ b/internal/auth/codex/siwc_id_token.go
+@@ -0,0 +1,87 @@
++package codex
++
++import (
++	"context"
++	"crypto/subtle"
++	"errors"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/coreos/go-oidc/v3/oidc"
++)
++
++// These trust anchors and RS256 come from OpenAI's production discovery
++// document. Neither the callback nor the JWT can choose an issuer or key URL.
++const (
++	siwcIssuer  = "https://auth.openai.com"
++	siwcJWKSURL = "https://auth.openai.com/.well-known/jwks.json"
++)
++
++type siwcSignatureKeySet interface {
++	VerifySignature(context.Context, string) ([]byte, error)
++}
++
++func newSIWCKeySet(client *http.Client) siwcSignatureKeySet {
++	keyClient := *client
++	// Only credential acquisition is bounded; inference transports are untouched.
++	keyClient.Timeout = 15 * time.Second
++	keyClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), &keyClient), siwcJWKSURL)
++}
++
++// verifySIWCIDToken is called only for authorization-code grants. Refresh does
++// not have a new authorization nonce and must retain its rotation/journal rules.
++func (o *CodexAuth) verifySIWCIDToken(ctx context.Context, tokens *CodexSIWCTokenData, expectedNonce string) error {
++	return o.verifySIWCIDTokenWithClock(ctx, tokens, expectedNonce, time.Now)
++}
++
++func (o *CodexAuth) verifySIWCIDTokenWithClock(ctx context.Context, tokens *CodexSIWCTokenData, expectedNonce string, nowFunc func() time.Time) error {
++	// Verification errors can contain token claims or JWKS response bodies.
++	// Return a fixed error so callers cannot accidentally log those values.
++	invalid := errors.New("SIWC ID token verification failed; start a new sign-in")
++	if o == nil || o.siwcKeySet == nil || tokens == nil || strings.TrimSpace(expectedNonce) == "" || ctx.Err() != nil {
++		return invalid
++	}
++	verifier := oidc.NewVerifier(siwcIssuer, o.siwcKeySet, &oidc.Config{
++		ClientID:             tokens.ClientID,
++		SupportedSigningAlgs: []string{oidc.RS256},
++		Now:                  nowFunc,
++	})
++	identity, errVerify := verifier.Verify(ctx, tokens.IDToken)
++	if errVerify != nil || ctx.Err() != nil {
++		return invalid
++	}
++	now := nowFunc()
++	if !identity.Expiry.After(now) ||
++		strings.TrimSpace(identity.Subject) == "" ||
++		identity.IssuedAt.IsZero() ||
++		identity.IssuedAt.After(now.Add(5*time.Second)) ||
++		!identity.Expiry.After(identity.IssuedAt) ||
++		subtle.ConstantTimeCompare([]byte(identity.Nonce), []byte(expectedNonce)) != 1 {
++		return invalid
++	}
++	var extra struct {
++		AuthorizedParty string   `json:"azp"`
++		NotBefore       *float64 `json:"nbf"`
++	}
++	if errClaims := identity.Claims(&extra); errClaims != nil {
++		return invalid
++	}
++	// Tighten go-oidc's default five-minute nbf leeway to five seconds.
++	if extra.NotBefore != nil && *extra.NotBefore > float64(now.Unix())+5 {
++		return invalid
++	}
++	if (len(identity.Audience) > 1 && extra.AuthorizedParty == "") ||
++		(extra.AuthorizedParty != "" && extra.AuthorizedParty != tokens.ClientID) {
++		return invalid
++	}
++	if identity.AccessTokenHash != "" {
++		if errHash := identity.VerifyAccessToken(tokens.AccessToken); errHash != nil {
++			return invalid
++		}
++	}
++	return nil
++}
+diff --git a/internal/auth/codex/siwc_id_token_test.go b/internal/auth/codex/siwc_id_token_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/auth/codex/siwc_id_token_test.go
+@@ -0,0 +1,245 @@
++package codex
++
++import (
++	"context"
++	"crypto"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/MoeForge/moego/base64"
++	"github.com/MoeForge/moego/ojson"
++	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/siwctest"
++)
++
++// Existing parser/refresh tests can use a real signed initial ID token without
++// adding network requests or weakening the production verifier.
++func testSIWCIDToken(t *testing.T, auth *CodexAuth, clientID string) string {
++	t.Helper()
++	key := siwctest.NewKey(t)
++	auth.siwcKeySet = &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}
++	return siwctest.Token(t, key, "test-key", clientID, "test-nonce", nil)
++}
++
++func TestSIWCExchangeVerifiesIDToken(t *testing.T) {
++	key := siwctest.NewKey(t)
++	otherKey := siwctest.NewKey(t)
++	const clientID = "oaiapp_test"
++	const nonce = "attempt-nonce"
++	for _, tc := range []struct {
++		name   string
++		claims map[string]any
++		drop   string
++		mode   string
++		ok     bool
++	}{
++		{name: "valid", ok: true},
++		{name: "array audience", claims: map[string]any{"aud": []string{clientID}}, ok: true},
++		{name: "multiple audiences with azp", claims: map[string]any{"aud": []string{clientID, "other"}, "azp": clientID}, ok: true},
++		{name: "bad signature", mode: "other-key"},
++		{name: "unknown kid", mode: "unknown-kid"},
++		{name: "malformed", mode: "malformed"},
++		{name: "unsigned", mode: "none"},
++		{name: "HMAC confusion", mode: "HS256"},
++		{name: "bad issuer", claims: map[string]any{"iss": "https://untrusted.invalid"}},
++		{name: "bad audience", claims: map[string]any{"aud": "another-client"}},
++		{name: "bad nonce", claims: map[string]any{"nonce": "another-attempt"}},
++		{name: "missing nonce", drop: "nonce"},
++		{name: "expired", claims: map[string]any{"exp": time.Now().Add(-time.Minute).Unix()}},
++		{name: "missing expiry", drop: "exp"},
++		{name: "missing iat", drop: "iat"},
++		{name: "future iat", claims: map[string]any{"iat": time.Now().Add(time.Hour).Unix()}},
++		{name: "future nbf within library leeway", claims: map[string]any{"nbf": time.Now().Add(time.Minute).Unix()}},
++		{name: "empty subject", claims: map[string]any{"sub": ""}},
++		{name: "missing subject", drop: "sub"},
++		{name: "wrong claim type", claims: map[string]any{"nonce": 123}},
++		{name: "multiple audiences missing azp", claims: map[string]any{"aud": []string{clientID, "other"}}},
++		{name: "wrong azp", claims: map[string]any{"azp": "another-client"}},
++		{name: "bad access token hash", claims: map[string]any{"at_hash": "incorrect"}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			signingKey, kid := key, "test-key"
++			if tc.mode == "other-key" {
++				signingKey = otherKey
++			}
++			if tc.mode == "unknown-kid" {
++				kid = "missing-key"
++			}
++			token := siwctest.Token(t, signingKey, kid, clientID, nonce, func(doc *ojson.Doc) {
++				for name, value := range tc.claims {
++					if errSet := doc.Set(name, value); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++				if tc.drop != "" {
++					if errDelete := doc.Delete(tc.drop); errDelete != nil {
++						t.Fatal(errDelete)
++					}
++				}
++			})
++			if tc.mode == "malformed" {
++				token = "not-a-jwt"
++			}
++			if tc.mode == "none" || tc.mode == "HS256" {
++				parts := strings.Split(token, ".")
++				header := ojson.NewDocString("{}")
++				if errSet := header.Set("alg", tc.mode); errSet != nil {
++					t.Fatal(errSet)
++				}
++				token = base64.RawURLEncoding.EncodeToString(header.Bytes()) + "." + parts[1] + "." + parts[2]
++			}
++			var keyRequests atomic.Int32
++			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				body := ""
++				switch req.URL.String() {
++				case SIWCTokenURL:
++					if errForm := req.ParseForm(); errForm != nil {
++						return nil, errForm
++					}
++					if req.Form.Get("code_verifier") != "verifier" || req.Form.Get("client_id") != clientID {
++						t.Error("lost PKCE or issued client ID")
++					}
++					body = siwctest.Response(t, token)
++				case siwcJWKSURL:
++					if req.Header.Get("Authorization") != "" {
++						t.Error("credentials sent to JWKS")
++					}
++					keyRequests.Add(1)
++					body = siwctest.JWKS(t, key, "test-key")
++				default:
++					return nil, errors.New("unexpected network request")
++				}
++				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
++			})}
++			auth := &CodexAuth{httpClient: client, siwcKeySet: newSIWCKeySet(client)}
++			tokens, errExchange := auth.ExchangeSIWCCodeForTokens(context.Background(), "code", clientID, SIWCRedirectURI, "", &PKCECodes{CodeVerifier: "verifier"}, nonce)
++			if tc.ok {
++				if errExchange != nil || tokens == nil {
++					t.Fatalf("valid signed token rejected: %v", errExchange)
++				}
++				if keyRequests.Load() != 1 {
++					t.Fatal("valid token did not use the trusted JWKS")
++				}
++			} else if errExchange == nil || tokens != nil {
++				t.Fatal("invalid token returned credentials")
++			} else if errExchange.Error() != "SIWC ID token verification failed; start a new sign-in" {
++				t.Fatalf("verification error may expose claims: %v", errExchange)
++			}
++		})
++	}
++}
++
++func TestSIWCExchangeRequiresPendingNonceAndIssuedClient(t *testing.T) {
++	var requests atomic.Int32
++	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
++		requests.Add(1)
++		return nil, errors.New("must not exchange")
++	})}}
++	for _, tc := range []struct{ client, nonce string }{
++		{"oaiapp_test", ""}, {"oaiapp_test", " "}, {"", "nonce"}, {SIWCDynamicClientID, "nonce"},
++	} {
++		tokens, errExchange := auth.ExchangeSIWCCodeForTokens(context.Background(), "code", tc.client, "", "", &PKCECodes{CodeVerifier: "verifier"}, tc.nonce)
++		if errExchange == nil || tokens != nil {
++			t.Fatal("accepted incomplete transaction")
++		}
++	}
++	if requests.Load() != 0 {
++		t.Fatal("incomplete transaction made a token request")
++	}
++}
++
++func TestSIWCJWKSCacheRotationAndFailure(t *testing.T) {
++	key1, key2 := siwctest.NewKey(t), siwctest.NewKey(t)
++	var requests atomic.Int32
++	var keys atomic.Value
++	keys.Store(siwctest.JWKS(t, key1, "one"))
++	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++		if req.URL.String() != siwcJWKSURL {
++			return nil, errors.New("unexpected key URL")
++		}
++		requests.Add(1)
++		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(keys.Load().(string)))}, nil
++	})}
++	auth := &CodexAuth{siwcKeySet: newSIWCKeySet(client)}
++	token := &CodexSIWCTokenData{ClientID: "oaiapp_test", IDToken: siwctest.Token(t, key1, "one", "oaiapp_test", "nonce", nil)}
++	for i := 0; i < 2; i++ {
++		if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify != nil {
++			t.Fatal(errVerify)
++		}
++	}
++	if requests.Load() != 1 {
++		t.Fatal("keys not cached")
++	}
++	keys.Store(siwctest.JWKS(t, key2, "two"))
++	token.IDToken = siwctest.Token(t, key2, "two", "oaiapp_test", "nonce", nil)
++	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify != nil || requests.Load() != 2 {
++		t.Fatalf("key rotation failed: %v", errVerify)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if errVerify := auth.verifySIWCIDToken(ctx, token, "nonce"); errVerify == nil {
++		t.Fatal("cancelled verification accepted")
++	}
++	// A new verifier has no cached key; malformed JWKS must fail closed.
++	keys.Store("not-json")
++	auth.siwcKeySet = newSIWCKeySet(client)
++	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify == nil {
++		t.Fatal("malformed JWKS accepted")
++	}
++}
++
++func TestSIWCJWKSDoesNotFollowRedirects(t *testing.T) {
++	var redirected atomic.Int32
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		redirected.Add(1)
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer target.Close()
++	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++		if req.URL.String() == siwcJWKSURL {
++			return &http.Response{StatusCode: 302, Header: http.Header{"Location": {target.URL}}, Body: io.NopCloser(strings.NewReader(""))}, nil
++		}
++		return http.DefaultTransport.RoundTrip(req)
++	})}
++	key := siwctest.NewKey(t)
++	auth := &CodexAuth{siwcKeySet: newSIWCKeySet(client)}
++	token := &CodexSIWCTokenData{ClientID: "oaiapp_test", IDToken: siwctest.Token(t, key, "key", "oaiapp_test", "nonce", nil)}
++	if errVerify := auth.verifySIWCIDToken(context.Background(), token, "nonce"); errVerify == nil || redirected.Load() != 0 {
++		t.Fatal("redirected JWKS accepted or contacted")
++	}
++}
++
++type siwcTestKeySet func(context.Context, string) ([]byte, error)
++
++func (f siwcTestKeySet) VerifySignature(ctx context.Context, token string) ([]byte, error) {
++	return f(ctx, token)
++}
++
++func TestSIWCExpiryCheckedAfterKeyFetch(t *testing.T) {
++	key := siwctest.NewKey(t)
++	clock := time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
++	start := clock
++	token := &CodexSIWCTokenData{ClientID: "oaiapp_test", IDToken: siwctest.Token(t, key, "key", "oaiapp_test", "nonce", func(doc *ojson.Doc) {
++		if errSet := doc.Set("iat", start.Unix()); errSet != nil {
++			t.Fatal(errSet)
++		}
++		if errSet := doc.Set("exp", start.Add(time.Minute).Unix()); errSet != nil {
++			t.Fatal(errSet)
++		}
++	})}
++	keys := &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}
++	auth := &CodexAuth{siwcKeySet: siwcTestKeySet(func(ctx context.Context, raw string) ([]byte, error) {
++		// Model time passing during key retrieval without sleeping.
++		clock = clock.Add(2 * time.Minute)
++		return keys.VerifySignature(ctx, raw)
++	})}
++	if errVerify := auth.verifySIWCIDTokenWithClock(context.Background(), token, "nonce", func() time.Time { return clock }); errVerify == nil {
++		t.Fatal("token that expired during key retrieval was accepted")
++	}
++}
+diff --git a/internal/auth/codex/siwc_renewal_test.go b/internal/auth/codex/siwc_renewal_test.go
+--- a/internal/auth/codex/siwc_renewal_test.go
++++ b/internal/auth/codex/siwc_renewal_test.go
+@@ -37,10 +37,16 @@
+ 			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+ 				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+ 			})}}
++			if tc.exchange {
++				if errSet := doc.Set("id_token", testSIWCIDToken(t, auth, "oaiapp_scope")); errSet != nil {
++					t.Fatal(errSet)
++				}
++				body = doc.String()
++			}
+ 			auth.SetRefreshJournal(&memoryRefreshJournal{})
+ 			var err error
+ 			if tc.exchange {
+-				_, err = auth.ExchangeSIWCCodeForTokens(context.Background(), "code", "oaiapp_scope", "", "", &PKCECodes{CodeVerifier: "verifier"})
++				_, err = auth.ExchangeSIWCCodeForTokens(context.Background(), "code", "oaiapp_scope", "", "", &PKCECodes{CodeVerifier: "verifier"}, "test-nonce")
+ 			} else {
+ 				_, err = auth.RefreshSIWCTokens(context.Background(), "refresh", "oaiapp_scope", "")
+ 			}
+diff --git a/internal/cmd/siwc_bind.go b/internal/cmd/siwc_bind.go
+--- a/internal/cmd/siwc_bind.go
++++ b/internal/cmd/siwc_bind.go
+@@ -333,7 +333,7 @@
+ 		return
+ 	}
+ 
+-	siwcData, errExchange := authSvc.ExchangeSIWCCodeForTokens(context.Background(), result.Code, issuedClientID, redirectURI, deviceID, pkceCodes)
++	siwcData, errExchange := authSvc.ExchangeSIWCCodeForTokens(context.Background(), result.Code, issuedClientID, redirectURI, deviceID, pkceCodes, nonce)
+ 	if errExchange != nil {
+ 		fmt.Printf("Sign in with ChatGPT token exchange failed: %v\n", errExchange)
+ 		return
+diff --git a/internal/cmd/siwc_reauth_test.go b/internal/cmd/siwc_reauth_test.go
+--- a/internal/cmd/siwc_reauth_test.go
++++ b/internal/cmd/siwc_reauth_test.go
+@@ -11,12 +11,14 @@
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/MoeForge/moego/ojson"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/siwctest"
+ )
+ 
+ type siwcBindRoundTripper func(*http.Request) (*http.Response, error)
+@@ -25,12 +27,16 @@
+ 
+ func TestDoSIWCBindReusesSavedRegistration(t *testing.T) {
+ 	for _, tc := range []struct {
+-		name, returned string
+-		wantSuccess    bool
++		name, returned, tokenMode string
++		wantSuccess              bool
++		wantExchanges            int
+ 	}{
+-		{"callback omits unchanged client", "", true},
+-		{"callback confirms saved client", "oaiapp_saved", true},
+-		{"callback changes client", "oaiapp_other", false},
++		{"callback omits unchanged client", "", "", true, 1},
++		{"callback confirms saved client", "oaiapp_saved", "", true, 1},
++		{"callback changes client", "oaiapp_other", "", false, 0},
++		{"invalid signature", "oaiapp_saved", "signature", false, 1},
++		{"wrong nonce", "oaiapp_saved", "nonce", false, 1},
++		{"expired token", "oaiapp_saved", "expiry", false, 1},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			dir := t.TempDir()
+@@ -50,7 +56,12 @@
+ 			previousTransport := http.DefaultTransport
+ 			t.Cleanup(func() { http.DefaultTransport = previousTransport })
+ 			exchanges := 0
++			key, otherKey := siwctest.NewKey(t), siwctest.NewKey(t)
++			var nonce atomic.Value
+ 			http.DefaultTransport = siwcBindRoundTripper(func(req *http.Request) (*http.Response, error) {
++				if req.URL.String() == "https://auth.openai.com/.well-known/jwks.json" {
++					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(siwctest.JWKS(t, key, "test-key")))}, nil
++				}
+ 				if req.URL.String() != codex.SIWCTokenURL {
+ 					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("127.0.0.1"))}, nil
+ 				}
+@@ -61,7 +72,23 @@
+ 				if req.Form.Get("client_id") != "oaiapp_saved" {
+ 					t.Errorf("token exchange did not use the saved registration")
+ 				}
+-				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"new","refresh_token":"new-refresh","id_token":"id","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`))}, nil
++				signingKey := key
++				if tc.tokenMode == "signature" {
++					signingKey = otherKey
++				}
++				token := siwctest.Token(t, signingKey, "test-key", "oaiapp_saved", nonce.Load().(string), func(doc *ojson.Doc) {
++					if tc.tokenMode == "nonce" {
++						if errSet := doc.Set("nonce", "wrong-nonce"); errSet != nil {
++							t.Error(errSet)
++						}
++					}
++					if tc.tokenMode == "expiry" {
++						if errSet := doc.Set("exp", time.Now().Add(-time.Minute).Unix()); errSet != nil {
++							t.Error(errSet)
++						}
++					}
++				})
++				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(siwctest.Response(t, token)))}, nil
+ 			})
+ 			reader, writer, errPipe := os.Pipe()
+ 			if errPipe != nil {
+@@ -97,6 +124,7 @@
+ 					t.Fatal(errParse)
+ 				}
+ 				query := authURL.Query()
++				nonce.Store(query.Get("nonce"))
+ 				if query.Get("client_id") != "oaiapp_saved" || query.Has("agent_name_hint") || query.Get("ext_agent_host_id") != "urn:uuid:e61bbe28-07ef-466d-8e5d-a344f94ab305" || query.Get("code_challenge") == "" {
+ 					t.Error("authorization URL did not preserve the issued registration, host identity, and PKCE")
+ 				}
+@@ -135,8 +163,8 @@
+ 				if exchanges != 1 || ojson.GetBytes(raw, "siwc.refresh_token").String() != "new-refresh" || ojson.GetBytes(raw, "siwc.client_id").String() != "oaiapp_saved" {
+ 					t.Fatal("reauthorization did not persist the replacement under the saved client")
+ 				}
+-			} else if exchanges != 0 || string(raw) != initial {
+-				t.Fatal("mismatched callback exchanged tokens or changed the credential")
++			} else if exchanges != tc.wantExchanges || string(raw) != initial {
++				t.Fatal("rejected callback/token changed the credential or unexpected exchange count")
+ 			}
+ 		})
+ 	}
+diff --git a/internal/testutil/siwctest/tokens.go b/internal/testutil/siwctest/tokens.go
+new file mode 100644
+--- /dev/null
++++ b/internal/testutil/siwctest/tokens.go
+@@ -0,0 +1,85 @@
++// Package siwctest supplies synthetic, signed tokens for offline auth tests.
++// It has no production consumers and never contains real credentials.
++package siwctest
++
++import (
++	"crypto/rand"
++	"crypto/rsa"
++	"math/big"
++	"testing"
++	"time"
++
++	"github.com/MoeForge/moego/base64"
++	"github.com/MoeForge/moego/ojson"
++	"github.com/go-jose/go-jose/v4"
++)
++
++func NewKey(t *testing.T) *rsa.PrivateKey {
++	t.Helper()
++	key, errKey := rsa.GenerateKey(rand.Reader, 2048)
++	if errKey != nil {
++		t.Fatal(errKey)
++	}
++	return key
++}
++
++func Token(t *testing.T, key *rsa.PrivateKey, kid, clientID, nonce string, mutate func(*ojson.Doc)) string {
++	t.Helper()
++	now := time.Now().Unix()
++	doc := ojson.NewDocString("{}")
++	for name, value := range map[string]any{
++		"iss": "https://auth.openai.com", "sub": "synthetic-subject",
++		"aud": clientID, "nonce": nonce, "iat": now, "exp": now + 3600,
++	} {
++		if errSet := doc.Set(name, value); errSet != nil {
++			t.Fatal(errSet)
++		}
++	}
++	if mutate != nil {
++		mutate(doc)
++	}
++	signer, errSigner := jose.NewSigner(jose.SigningKey{
++		Algorithm: jose.RS256,
++		Key:       jose.JSONWebKey{Key: key, KeyID: kid},
++	}, nil)
++	if errSigner != nil {
++		t.Fatal(errSigner)
++	}
++	signed, errSign := signer.Sign(doc.Bytes())
++	if errSign != nil {
++		t.Fatal(errSign)
++	}
++	raw, errSerialize := signed.CompactSerialize()
++	if errSerialize != nil {
++		t.Fatal(errSerialize)
++	}
++	return raw
++}
++
++func JWKS(t *testing.T, key *rsa.PrivateKey, kid string) string {
++	t.Helper()
++	doc := ojson.NewDocString("{}")
++	if errSet := doc.Set("keys", []map[string]any{{
++		"kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
++		"n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
++		"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
++	}}); errSet != nil {
++		t.Fatal(errSet)
++	}
++	return doc.String()
++}
++
++func Response(t *testing.T, idToken string) string {
++	t.Helper()
++	doc := ojson.NewDocString("{}")
++	for name, value := range map[string]any{
++		"access_token": "new", "refresh_token": "new-refresh",
++		"id_token": idToken, "expires_in": 3600,
++		"scope": "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
++	} {
++		if errSet := doc.Set(name, value); errSet != nil {
++			t.Fatal(errSet)
++		}
++	}
++	return doc.String()
++}

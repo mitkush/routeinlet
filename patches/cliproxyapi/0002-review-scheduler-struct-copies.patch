@@ -1,0 +1,11 @@
+diff --git a/internal/util/nocopy_invariant_test.go b/internal/util/nocopy_invariant_test.go
+--- a/internal/util/nocopy_invariant_test.go
++++ b/internal/util/nocopy_invariant_test.go
+@@ -104,6 +104,7 @@
+ }
+ 
+ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
++	"sdk/cliproxy/auth/selector_weighted.go": {2, "shifts []weightedPoolMember structs for insertion/removal; copies string headers and numeric bookkeeping, never bytes of a JSON payload"},
+ 	"internal/kvstore/bolt_store.go":                                {1, "copies into a freshly allocated envelope before publication; no no-copy JSON result can alias the destination"},
+ 	"internal/translator/common/apply_patch_responses.go":           {1, "shifts [][]byte item references in a private output slice; no byte of any JSON payload is rewritten"},
+ 	"internal/translator/common/vertex_partial_args.go":             {1, "shifts []string object keys to insert a key; no byte of any payload is rewritten"},
