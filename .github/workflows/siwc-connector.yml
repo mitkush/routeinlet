@@ -71,13 +71,14 @@ jobs:
       - name: Vet, build, and race-test SIWC paths
         working-directory: ${{ runner.temp }}/siwc-connector
         run: |
-          go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management
+          go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management ./sdk/cliproxy/auth
           go build -o test-output ./cmd/server
           rm test-output
           go test -race ./internal/auth/codex ./internal/cmd -count=1 -timeout=15m
           # The full management suite has an upstream xAI fixture cleanup race.
           # Race-check all SIWC cases; the full suite still runs below without -race.
           go test -race ./internal/api/handlers/management -run SIWC -count=1 -timeout=15m
+          go test -race ./sdk/cliproxy/auth -run '^TestBindCodexSIWC' -count=1 -timeout=15m
       - name: Test connector suite
         if: matrix.os == 'ubuntu-latest'
         working-directory: ${{ runner.temp }}/siwc-connector

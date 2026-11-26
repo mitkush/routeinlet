@@ -19,6 +19,11 @@ payload bytes. The entry records exactly two operations and that justification;
 the invariant test remains enabled. CI checks the missing entry against the
 unpatched pin before running the patched full suite.
 
+The third patch persists the verified SIWC identity, checks returning-account
+identity, and saves the host ID before browser authorization. See
+[Account binding and migration](Account_Binding.md) for the exact first-binding
+requirements and remaining live-qualification limits.
+
 ## Verification
 
 - Use `coreos/go-oidc/v3 v3.16.0` and `go-jose/v4 v4.1.3`.
@@ -52,6 +57,7 @@ sh scripts/prepare-siwc-connector.sh "$HOME/routeinlet-siwc-review"
   go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management &&
   go test -race ./internal/auth/codex ./internal/cmd -count=1 &&
   go test -race ./internal/api/handlers/management -run SIWC -count=1 &&
+  go test -race ./sdk/cliproxy/auth -run '^TestBindCodexSIWC' -count=1 &&
   go test ./... -count=1 &&
   go build -o cli-proxy-api ./cmd/server
 )
@@ -80,11 +86,13 @@ qualify SIWC as a complete RouteInlet integration. In particular:
 - Refresh rotation and journal behavior are unchanged. Refresh ID tokens are
   not newly authenticated by this patch; do not treat them as verified identity
   evidence or reuse this code as a refresh verifier.
-- Account/registration association still needs review: persist the verified
-  issuer/client/subject identity and enforce returning-account identity matching.
-  A verified token alone does not prove it belongs to the existing outer Codex
-  credential. Stable host-ID persistence before first authorization and the
-  management reauthorization path also need qualification.
+- Returning-account identity checks, stable host-ID persistence and management
+  reauthorization are implemented with synthetic tests. First binding/legacy
+  migration requires matching signed subject and workspace claims from both
+  the selected Codex login and the new SIWC token. This compatibility has not
+  been established against live OpenAI accounts; unavailable or differing claims
+  reject binding. Read [Account binding and migration](Account_Binding.md)
+  before testing. No email-based or unverified-claim association is allowed.
 - No live SIWC consent, refresh, model listing, inference, or billing test was
   performed. The passing Codex-login pilot is not evidence for those paths.
 - Per-request funding stays unverified. No paid fallback is added.
