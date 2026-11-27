@@ -32,8 +32,11 @@ the existing gated transport to block one write, fill exactly two queue slots,
 and check both the rejection and healthy-peer delivery; it then releases and
 checks the accepted slow-peer frames. This replaces a socket flood and an
 unbounded barrier wait that could hang when the sender's control queue filled.
-No WebSocket production behavior or assertions are disabled. CI repeats the
-four affected tests under the race detector on Linux and macOS. The full Linux
+The API reauthorization fixture also waits for its hijacked WebSocket handler
+to finish logging before removing the temporary directory; HTTP server close
+alone does not wait for hijacked connections. No WebSocket production behavior
+or assertions are disabled. CI repeats the five affected tests under the race
+detector on Linux and macOS. The full Linux
 suite runs with `-p 1` to avoid competing package builds/tests during upstream
 20ms timing assertions; those thresholds remain unchanged.
 

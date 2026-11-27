@@ -83,6 +83,7 @@ jobs:
         working-directory: ${{ runner.temp }}/siwc-connector
         run: |
           go test -race ./internal/wstunnel -run '^(TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError|TestHubExchange_DiscoveryEventsAndControlCommands|TestHubAuth_MethodAndCredentials|TestHubExchange_SecurityGuardsAndBackpressureIsolation)$' -count=100 -timeout=5m
+          go test -race ./internal/api -run '^TestServerResponsesWebsocketReauthorizesEachTurn$' -count=100 -timeout=5m
       - name: Test connector suite
         if: matrix.os == 'ubuntu-latest'
         working-directory: ${{ runner.temp }}/siwc-connector
