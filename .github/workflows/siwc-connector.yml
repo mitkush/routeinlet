@@ -71,14 +71,22 @@ jobs:
       - name: Vet, build, and race-test SIWC paths
         working-directory: ${{ runner.temp }}/siwc-connector
         run: |
-          go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management
+          go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management ./sdk/cliproxy/auth
           go build -o test-output ./cmd/server
           rm test-output
           go test -race ./internal/auth/codex ./internal/cmd -count=1 -timeout=15m
           # The full management suite has an upstream xAI fixture cleanup race.
           # Race-check all SIWC cases; the full suite still runs below without -race.
           go test -race ./internal/api/handlers/management -run SIWC -count=1 -timeout=15m
+          go test -race ./sdk/cliproxy/auth -run '^TestBindCodexSIWC' -count=1 -timeout=15m
+      - name: Stress WebSocket test synchronization
+        working-directory: ${{ runner.temp }}/siwc-connector
+        run: |
+          go test -race ./internal/wstunnel -run '^(TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError|TestHubExchange_DiscoveryEventsAndControlCommands|TestHubAuth_MethodAndCredentials|TestHubExchange_SecurityGuardsAndBackpressureIsolation)$' -count=100 -timeout=5m
+          go test -race ./internal/api -run '^TestServerResponsesWebsocketReauthorizesEachTurn$' -count=100 -timeout=5m
       - name: Test connector suite
         if: matrix.os == 'ubuntu-latest'
         working-directory: ${{ runner.temp }}/siwc-connector
-        run: go test ./... -count=1 -timeout=15m
+        # The upstream executor tests assert a 20ms wall-clock budget. Avoid
+        # competing package builds/tests; keep every test and threshold intact.
+        run: go test -p 1 ./... -count=1 -timeout=15m

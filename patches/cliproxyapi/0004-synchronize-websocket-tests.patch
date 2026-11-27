@@ -1,0 +1,222 @@
+diff --git a/internal/wstunnel/control_review_test.go b/internal/wstunnel/control_review_test.go
+index db9e93a..a22b3a9 100644
+--- a/internal/wstunnel/control_review_test.go
++++ b/internal/wstunnel/control_review_test.go
+@@ -172,7 +172,7 @@ func TestPeerControl_PendingPongIsBoundedAndKeepsLatestPayload(t *testing.T) {
+ func TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError(t *testing.T) {
+ 	for _, opcode := range []byte{0x3, 0x7, 0xb, 0xf} {
+ 		t.Run(fmt.Sprintf("opcode=%x", opcode), func(t *testing.T) {
+-			hub := NewHub(Options{})
++			hub := NewHub(Options{PingInterval: time.Hour})
+ 			hub.UpdateAllowedAPIKeys([]string{"key"})
+ 			srv := newDeadlineTrackingTunnelServer(t, hub)
+ 			client := dialRole(t, srv.URL, "key", RoleClient, "device", "Device")
+@@ -180,6 +180,11 @@ func TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError(t *testing.T) {
+ 			p := lookupTunnelPeer(t, hub, "key", "device")
+ 			transport := p.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*deadlineTrackingTunnelConn)
+ 			transport.monitoring.Store(true)
++			// Receiving server_list does not mean its writer released writeMu.
++			// This case asserts the idle-writer close code; blocked-writer
++			// protocol errors have separate tests and may close abruptly.
++			p.writeMu.Lock()
++			p.writeMu.Unlock()
+ 			// Send a final, masked, empty frame using a reserved data/control opcode.
+ 			raw := []byte{0x80 | opcode, 0x80, 0, 0, 0, 0}
+ 			if n, errWrite := client.UnderlyingConn().Write(raw); errWrite != nil {
+diff --git a/internal/wstunnel/hub_auth_test.go b/internal/wstunnel/hub_auth_test.go
+index 182b868..04f305c 100644
+--- a/internal/wstunnel/hub_auth_test.go
++++ b/internal/wstunnel/hub_auth_test.go
+@@ -190,6 +190,7 @@ func TestHubAuth_MethodAndCredentials(t *testing.T) {
+ 			t.Fatalf("Dial with X-Tunnel-* headers error = %v", errDial)
+ 		}
+ 		registerCleanupConn(t, conn)
++		awaitTunnelServerRegistration(t, conn)
+ 
+ 		overrideConn, overResp, errOver := websocket.DefaultDialer.Dial(
+ 			dialTunnelURL(srv.URL, url.Values{"role": {"server"}, "uuid": {"hdr-srv-2"}, "name": {"Override Server"}, "type": {"Query-Type"}}),
+@@ -200,6 +201,7 @@ func TestHubAuth_MethodAndCredentials(t *testing.T) {
+ 			t.Fatalf("Dial with query type override error = %v", errOver)
+ 		}
+ 		registerCleanupConn(t, overrideConn)
++		awaitTunnelServerRegistration(t, overrideConn)
+ 
+ 		// Client role ignores type (both omitted and blank/arbitrary values allowed).
+ 		cliCheck, cliResp, errCli := websocket.DefaultDialer.Dial(
+diff --git a/internal/wstunnel/hub_exchange_test.go b/internal/wstunnel/hub_exchange_test.go
+index d59cf50..dd16e70 100644
+--- a/internal/wstunnel/hub_exchange_test.go
++++ b/internal/wstunnel/hub_exchange_test.go
+@@ -45,6 +45,21 @@ func dialRoleWithType(t *testing.T, serverURL, apiKey string, role Role, uuid, n
+ 	return conn
+ }
+ 
++// The HTTP upgrade can finish before commitPeer. A control response proves the
++// server read loop has started after registration, without sleeping or polling.
++func awaitTunnelServerRegistration(t *testing.T, conn *websocket.Conn) {
++	t.Helper()
++	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"list_servers","request_id":"registration-barrier"}`)); errWrite != nil {
++		t.Fatalf("registration barrier write: %v", errWrite)
++	}
++	frame := readTextJSONFrame(t, conn)
++	if frame.Get("type").String() != ControlTypeError ||
++		frame.Get("code").String() != ErrCodeUnsupportedRoleAction ||
++		frame.Get("request_id").String() != "registration-barrier" {
++		t.Fatalf("unexpected server registration barrier response: %s", frame.Raw)
++	}
++}
++
+ func readBinaryDataFrame(t *testing.T, conn *websocket.Conn) DataFrameView {
+ 	t.Helper()
+ 	msgType, raw, errRead := readTunnelTestMessage(conn)
+@@ -122,7 +137,9 @@ func TestHubExchange_DiscoveryEventsAndControlCommands(t *testing.T) {
+ 
+ 	// Connect servers out of lexicographical order to verify deterministic sorting and custom types.
+ 	srvB := dialRoleWithType(t, srv.URL, "key-disc", RoleServer, "srv-b", "Server B", "linux-builder")
+-	_ = dialRoleWithType(t, srv.URL, "key-disc", RoleServer, "srv-a", "Server A", "cpa-desktop")
++	srvA := dialRoleWithType(t, srv.URL, "key-disc", RoleServer, "srv-a", "Server A", "cpa-desktop")
++	awaitTunnelServerRegistration(t, srvB)
++	awaitTunnelServerRegistration(t, srvA)
+ 
+ 	cli := dialRole(t, srv.URL, "key-disc", RoleClient, "cli-1", "Client 1")
+ 	initial := readTextJSONFrame(t, cli)
+@@ -388,14 +405,14 @@ func TestHubExchange_ManyToManyFullDuplexMultiplexing(t *testing.T) {
+ }
+ 
+ func TestHubExchange_SecurityGuardsAndBackpressureIsolation(t *testing.T) {
+-	hub := NewHub(Options{SendQueueSize: 2})
++	hub := NewHub(Options{SendQueueSize: 2, PingInterval: time.Hour})
+ 	hub.UpdateAllowedAPIKeys([]string{"key-sec"})
+-	t.Cleanup(hub.Close)
+-	srv := httptest.NewServer(hub)
+-	t.Cleanup(srv.Close)
++	srv := newGatedTunnelServer(t, hub)
+ 
+ 	srvSlow := dialRole(t, srv.URL, "key-sec", RoleServer, "srv-slow", "Slow Server")
+ 	srvFast := dialRole(t, srv.URL, "key-sec", RoleServer, "srv-fast", "Fast Server")
++	awaitTunnelServerRegistration(t, srvSlow)
++	awaitTunnelServerRegistration(t, srvFast)
+ 	cli1 := dialRole(t, srv.URL, "key-sec", RoleClient, "cli-1", "Client 1")
+ 	cli2 := dialRole(t, srv.URL, "key-sec", RoleClient, "cli-2", "Client 2")
+ 	_ = readTextJSONFrame(t, cli1)
+@@ -428,49 +445,30 @@ func TestHubExchange_SecurityGuardsAndBackpressureIsolation(t *testing.T) {
+ 		t.Fatalf("server->server code = %q, want %q", got, ErrCodeInvalidTargetRole)
+ 	}
+ 
+-	// 3. Slow peer backpressure: flood srvSlow (without reading from it) until target_buffer_full arrives.
+-	gotBufferFull := make(chan struct{})
+-	syncDone := make(chan error, 1)
+-	go func() {
+-		var once sync.Once
+-		for {
+-			frame := readTextJSONFrame(t, cli1)
+-			if frame.Get("type").String() == ControlTypeError && frame.Get("code").String() == ErrCodeTargetBufferFull {
+-				once.Do(func() { close(gotBufferFull) })
+-				continue
+-			}
+-			if frame.Get("type").String() == ControlTypeServerList && frame.Get("request_id").String() == "post-flood-barrier" {
+-				syncDone <- nil
+-				return
+-			}
+-		}
+-	}()
+-
+-	largeChunk := bytes.Repeat([]byte("z"), 256*1024)
+-	floodDone := false
+-	for i := 0; i < 128 && !floodDone; i++ {
+-		pkt, _ := EncodeDataFrame(PayloadTypeBinary, "cli-1", "srv-slow", largeChunk)
+-		if errWrite := cli1.WriteMessage(websocket.BinaryMessage, pkt); errWrite != nil {
+-			t.Fatalf("WriteMessage(flood %d) error = %v", i, errWrite)
+-		}
+-		select {
+-		case <-gotBufferFull:
+-			floodDone = true
+-		default:
+-		}
++	// 3. Block only the slow transport, then fill exactly its two queue slots.
++	// Flooding until an asynchronously observed error also saturated cli1's
++	// control queue, losing the barrier response or terminating its reader.
++	slowPeer := lookupTunnelPeer(t, hub, "key-sec", "srv-slow")
++	transport := slowPeer.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*gatedTunnelConn)
++	transport.arm()
++	t.Cleanup(func() { _ = transport.Close() })
++	pkt, errEncode := EncodeDataFrame(PayloadTypeBinary, "cli-1", "srv-slow", []byte("queued"))
++	if errEncode != nil {
++		t.Fatal(errEncode)
+ 	}
+-	select {
+-	case <-gotBufferFull:
+-	case <-time.After(5 * time.Second):
+-		t.Fatal("timed out waiting for target_buffer_full from slow server")
++	if errWrite := cli1.WriteMessage(websocket.BinaryMessage, pkt); errWrite != nil {
++		t.Fatal(errWrite)
+ 	}
+-
+-	// Barrier sync via list_servers to deterministically drain all in-flight error frames on cli1.
+-	if errWrite := cli1.WriteMessage(websocket.TextMessage, []byte(`{"type":"list_servers","request_id":"post-flood-barrier"}`)); errWrite != nil {
+-		t.Fatalf("WriteMessage(barrier) error = %v", errWrite)
++	waitTunnelSignal(t, transport.blocked, "slow peer blocked write")
++	// One frame is in the blocked writer; two fit in the queue; the next fails.
++	for i := 0; i < cap(slowPeer.sendCh)+1; i++ {
++		if errWrite := cli1.WriteMessage(websocket.BinaryMessage, pkt); errWrite != nil {
++			t.Fatalf("WriteMessage(queue %d) error = %v", i, errWrite)
++		}
+ 	}
+-	if errSync := <-syncDone; errSync != nil {
+-		t.Fatalf("barrier sync error = %v", errSync)
++	full := readTextJSONFrame(t, cli1)
++	if full.Get("type").String() != ControlTypeError || full.Get("code").String() != ErrCodeTargetBufferFull {
++		t.Fatalf("expected target_buffer_full, got %s", full.Raw)
+ 	}
+ 
+ 	// Verify srvFast still exchanges traffic with cli1 without being blocked by srvSlow.
+@@ -482,7 +480,13 @@ func TestHubExchange_SecurityGuardsAndBackpressureIsolation(t *testing.T) {
+ 	if string(gotFast.Payload) != "fast-ok" {
+ 		t.Fatalf("srvFast payload = %q, want fast-ok", string(gotFast.Payload))
+ 	}
+-	_ = srvSlow
++	// The accepted slow frames must still arrive after release.
++	close(transport.gate)
++	for i := 0; i < cap(slowPeer.sendCh)+1; i++ {
++		if got := readBinaryDataFrame(t, srvSlow); string(got.Payload) != "queued" {
++			t.Fatalf("slow frame %d payload = %q, want queued", i, got.Payload)
++		}
++	}
+ }
+ 
+ func TestHubExchange_ControllablePingAndKeyRevocation(t *testing.T) {
+diff --git a/internal/api/server_test.go b/internal/api/server_test.go
+index 30cdbff..b79ea45 100644
+--- a/internal/api/server_test.go
++++ b/internal/api/server_test.go
+@@ -3927,8 +3927,28 @@ func TestServerResponsesWebsocketReauthorizesEachTurn(t *testing.T) {
+ 		registry.GetGlobalRegistry().UnregisterClient(authEntry.ID)
+ 	})
+ 
+-	httpServer := httptest.NewServer(server.engine)
+-	defer httpServer.Close()
++	var handlers sync.WaitGroup
++	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		handlers.Add(1)
++		defer handlers.Done()
++		server.engine.ServeHTTP(w, r)
++	}))
++	defer func() {
++		// Close stops new requests but does not wait for hijacked WebSockets.
++		// The client-close defer runs first; wait for handler logging to finish
++		// before TempDir cleanup removes the request log directory.
++		httpServer.Close()
++		done := make(chan struct{})
++		go func() {
++			handlers.Wait()
++			close(done)
++		}()
++		select {
++		case <-done:
++		case <-time.After(5 * time.Second):
++			t.Error("WebSocket handler did not finish after client close")
++		}
++	}()
+ 
+ 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/responses"
+ 	headers := http.Header{"Authorization": []string{"Bearer key-1"}}

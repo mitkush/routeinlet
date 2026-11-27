@@ -20,7 +20,7 @@ git -C "$destination" remote add origin https://github.com/router-for-me/CLIProx
 git -C "$destination" fetch --depth=1 origin 9a8ca1b577ef8573c5ccf108450b93ed57716cc4
 git -C "$destination" checkout --detach FETCH_HEAD
 test "$(git -C "$destination" rev-parse HEAD)" = 9a8ca1b577ef8573c5ccf108450b93ed57716cc4
-for patch_file in "$patch_dir/0001-verify-siwc-id-tokens.patch" "$patch_dir/0002-review-scheduler-struct-copies.patch"; do
+for patch_file in "$patch_dir/0001-verify-siwc-id-tokens.patch" "$patch_dir/0002-review-scheduler-struct-copies.patch" "$patch_dir/0003-bind-siwc-account-identity.patch" "$patch_dir/0004-synchronize-websocket-tests.patch"; do
   git -C "$destination" apply --check "$patch_file"
   git -C "$destination" apply --index "$patch_file"
 done

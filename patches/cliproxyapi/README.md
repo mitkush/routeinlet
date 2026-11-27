@@ -19,6 +19,27 @@ payload bytes. The entry records exactly two operations and that justification;
 the invariant test remains enabled. CI checks the missing entry against the
 unpatched pin before running the patched full suite.
 
+The third patch persists the verified SIWC identity, checks returning-account
+identity, and saves the host ID before browser authorization. See
+[Account binding and migration](Account_Binding.md) for the exact first-binding
+requirements and remaining live-qualification limits.
+
+The fourth patch only changes upstream WebSocket test fixtures. A successful
+HTTP upgrade can precede peer registration, so server fixtures now await a
+control response before other peers inspect discovery. The idle-writer protocol
+error case waits for the initial writer to release its lock. Backpressure uses
+the existing gated transport to block one write, fill exactly two queue slots,
+and check both the rejection and healthy-peer delivery; it then releases and
+checks the accepted slow-peer frames. This replaces a socket flood and an
+unbounded barrier wait that could hang when the sender's control queue filled.
+The API reauthorization fixture also waits for its hijacked WebSocket handler
+to finish logging before removing the temporary directory; HTTP server close
+alone does not wait for hijacked connections. No WebSocket production behavior
+or assertions are disabled. CI repeats the five affected tests under the race
+detector on Linux and macOS. The full Linux
+suite runs with `-p 1` to avoid competing package builds/tests during upstream
+20ms timing assertions; those thresholds remain unchanged.
+
 ## Verification
 
 - Use `coreos/go-oidc/v3 v3.16.0` and `go-jose/v4 v4.1.3`.
@@ -52,7 +73,8 @@ sh scripts/prepare-siwc-connector.sh "$HOME/routeinlet-siwc-review"
   go vet ./internal/auth/codex ./internal/cmd ./internal/api/handlers/management &&
   go test -race ./internal/auth/codex ./internal/cmd -count=1 &&
   go test -race ./internal/api/handlers/management -run SIWC -count=1 &&
-  go test ./... -count=1 &&
+  go test -race ./sdk/cliproxy/auth -run '^TestBindCodexSIWC' -count=1 &&
+  go test -p 1 ./... -count=1 -timeout=15m &&
   go build -o cli-proxy-api ./cmd/server
 )
 ```
@@ -80,11 +102,13 @@ qualify SIWC as a complete RouteInlet integration. In particular:
 - Refresh rotation and journal behavior are unchanged. Refresh ID tokens are
   not newly authenticated by this patch; do not treat them as verified identity
   evidence or reuse this code as a refresh verifier.
-- Account/registration association still needs review: persist the verified
-  issuer/client/subject identity and enforce returning-account identity matching.
-  A verified token alone does not prove it belongs to the existing outer Codex
-  credential. Stable host-ID persistence before first authorization and the
-  management reauthorization path also need qualification.
+- Returning-account identity checks, stable host-ID persistence and management
+  reauthorization are implemented with synthetic tests. First binding/legacy
+  migration requires matching signed subject and workspace claims from both
+  the selected Codex login and the new SIWC token. This compatibility has not
+  been established against live OpenAI accounts; unavailable or differing claims
+  reject binding. Read [Account binding and migration](Account_Binding.md)
+  before testing. No email-based or unverified-claim association is allowed.
 - No live SIWC consent, refresh, model listing, inference, or billing test was
   performed. The passing Codex-login pilot is not evidence for those paths.
 - Per-request funding stays unverified. No paid fallback is added.

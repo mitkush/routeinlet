@@ -1,0 +1,978 @@
+diff --git a/internal/api/handlers/management/oauth_siwc.go b/internal/api/handlers/management/oauth_siwc.go
+index 1a608fb..8e678cf 100644
+--- a/internal/api/handlers/management/oauth_siwc.go
++++ b/internal/api/handlers/management/oauth_siwc.go
+@@ -14,7 +14,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+-	"github.com/google/uuid"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+@@ -26,12 +25,15 @@ const siwcBindTTL = 5 * time.Minute
+ 
+ type siwcOAuthService interface {
+ 	GenerateSIWCAuthURL(state, nonce, deviceID, redirectURI string, pkce *codex.PKCECodes) (string, error)
++	GenerateSIWCReauthURL(clientID, state, nonce, deviceID, redirectURI string, pkce *codex.PKCECodes) (string, error)
+ 	ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirectURI, deviceID string, pkce *codex.PKCECodes, expectedNonce string) (*codex.CodexSIWCTokenData, error)
+ }
+ 
+ // siwcBindSession is server-owned: callbacks cannot select a different target,
+ // redirect URI, PKCE verifier, or token endpoint. It never contains an auth snapshot.
+ type siwcBindSession struct {
++	binding      *codex.SIWCBinding
++	clientID     string
+ 	mu           sync.Mutex
+ 	owner        *Handler
+ 	manager      *coreauth.Manager
+@@ -242,11 +244,24 @@ func (h *Handler) StartSIWCBind(c *gin.Context) {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": "SIWC binding target is unavailable or invalid"})
+ 		return
+ 	}
+-	deviceID := uuid.NewString()
++	binding, errBinding := codex.NewCodexAuth(cfg).PrepareSIWCBinding(c.Request.Context(), metadata)
++	if errBinding != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": errBinding.Error()})
++		return
++	}
++	preferred := ""
+ 	if section, okSection := metadata["siwc"].(map[string]any); okSection {
+-		if existing, _ := section["device_id"].(string); codex.IsValidUUID(existing) {
+-			deviceID = strings.ToLower(strings.TrimSpace(existing))
+-		}
++		preferred, _ = section["device_id"].(string)
++	}
++	hostDir, errHostDir := util.ResolveAuthDir(cfg.AuthDir)
++	if errHostDir != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "SIWC host directory is unavailable"})
++		return
++	}
++	deviceID, errDevice := codex.EnsureSIWCHostID(hostDir, preferred)
++	if errDevice != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "SIWC host state is unavailable or conflicts with the selected registration"})
++		return
+ 	}
+ 	pkce, errPKCE := codex.GeneratePKCECodes()
+ 	state, errState := codex.GenerateRandomBase64URL()
+@@ -260,12 +275,15 @@ func (h *Handler) StartSIWCBind(c *gin.Context) {
+ 		service = factory(cfg)
+ 	}
+ 	authURL, errURL := service.GenerateSIWCAuthURL(state, nonce, deviceID, codex.SIWCRedirectURI, pkce)
++	if binding.ClientID() != "" {
++		authURL, errURL = service.GenerateSIWCReauthURL(binding.ClientID(), state, nonce, deviceID, codex.SIWCRedirectURI, pkce)
++	}
+ 	if errURL != nil {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate SIWC authorization URL"})
+ 		return
+ 	}
+ 	ctx, cancel := context.WithTimeout(PopulateAuthContext(context.Background(), c), siwcBindTTL)
+-	flow := &siwcBindSession{owner: h, manager: manager, service: service, targetID: target.ID, epoch: target.RegistrationEpoch,
++	flow := &siwcBindSession{binding: binding, clientID: binding.ClientID(), owner: h, manager: manager, service: service, targetID: target.ID, epoch: target.RegistrationEpoch,
+ 		accountID: accountID, path: path, authDir: cfg.AuthDir, deviceID: deviceID, redirect: codex.SIWCRedirectURI, nonce: nonce, pkce: pkce, ctx: ctx, cancel: cancel}
+ 	if !oauthSessions.registerSIWC(state, flow) {
+ 		cancel()
+@@ -388,6 +406,17 @@ func (h *Handler) handleOAuthCallbackV8(c *gin.Context, req siwcCallbackRequest)
+ 			}
+ 		}
+ 	}
++	if oauthError == "" && flow.clientID != "" {
++		if clientID != "" && clientID != flow.clientID {
++			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "callback client ID does not match the selected registration"})
++			return
++		}
++		clientID = flow.clientID
++	}
++	if oauthError == "" && clientID == codex.SIWCDynamicClientID {
++		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "callback requires an issued client ID"})
++		return
++	}
+ 	if oauthError == "" && (code == "" || clientID == "") {
+ 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "SIWC callback requires code and client_id"})
+ 		return
+@@ -459,7 +488,7 @@ func (flow *siwcBindSession) exchange(state, code, clientID string) {
+ 		flow.pkce = nil
+ 		return
+ 	}
+-	updated, errBind := flow.manager.BindCodexSIWC(flow.ctx, flow.targetID, flow.epoch, flow.accountID, tokenData)
++	updated, errBind := flow.manager.BindCodexSIWCVerified(flow.ctx, flow.targetID, flow.epoch, flow.accountID, tokenData, flow.binding)
+ 	if errBind != nil {
+ 		flow.fail(state, "Failed to save SIWC binding; the target may have changed")
+ 		return
+diff --git a/internal/api/handlers/management/oauth_siwc_test.go b/internal/api/handlers/management/oauth_siwc_test.go
+index eef0e77..696f89a 100644
+--- a/internal/api/handlers/management/oauth_siwc_test.go
++++ b/internal/api/handlers/management/oauth_siwc_test.go
+@@ -24,7 +24,7 @@ import (
+ 
+ type siwcExchangeInput struct {
+ 	code, clientID, redirect, deviceID, nonce string
+-	pkce                               *codex.PKCECodes
++	pkce                                      *codex.PKCECodes
+ }
+ 
+ type testSIWCOAuth struct {
+@@ -38,6 +38,10 @@ func (s *testSIWCOAuth) GenerateSIWCAuthURL(state, nonce, deviceID, redirect str
+ 	return codex.NewCodexAuth(nil).GenerateSIWCAuthURL(state, nonce, deviceID, redirect, pkce)
+ }
+ 
++func (s *testSIWCOAuth) GenerateSIWCReauthURL(clientID, state, nonce, deviceID, redirect string, pkce *codex.PKCECodes) (string, error) {
++	return codex.NewCodexAuth(nil).GenerateSIWCReauthURL(clientID, state, nonce, deviceID, redirect, pkce)
++}
++
+ func (s *testSIWCOAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, clientID, redirect, deviceID string, pkce *codex.PKCECodes, expectedNonce string) (*codex.CodexSIWCTokenData, error) {
+ 	s.calls.Add(1)
+ 	s.inputs <- siwcExchangeInput{code, clientID, redirect, deviceID, expectedNonce, pkce}
+@@ -49,7 +53,7 @@ func (s *testSIWCOAuth) ExchangeSIWCCodeForTokens(ctx context.Context, code, cli
+ 	if s.err != nil {
+ 		return nil, s.err
+ 	}
+-	return &codex.CodexSIWCTokenData{AccessToken: "new-siwc", RefreshToken: "new-siwc-refresh", ClientID: clientID, DeviceID: deviceID, Expire: "2035-01-01T00:00:00Z", ExpiresAt: "2035-01-01T00:00:00Z"}, nil
++	return &codex.CodexSIWCTokenData{Issuer: "https://auth.openai.com", Subject: "synthetic-subject", AccessToken: "new-siwc", RefreshToken: "new-siwc-refresh", ClientID: clientID, DeviceID: deviceID, Expire: "2035-01-01T00:00:00Z", ExpiresAt: "2035-01-01T00:00:00Z"}, nil
+ }
+ 
+ type siwcFixture struct {
+@@ -69,7 +73,7 @@ func setupSIWCFlow(t *testing.T, blocked bool) *siwcFixture {
+ 	replaceOAuthSessionStoreForTest(t, store)
+ 	dir := t.TempDir()
+ 	path := filepath.Join(dir, "codex.json")
+-	metadata := map[string]any{"type": "codex", "access_token": "outer", "refresh_token": "outer-refresh", "account_id": "account", "note": "keep", "siwc": map[string]any{"device_id": "e61bbe28-07ef-466d-8e5d-a344f94ab305"}}
++	metadata := map[string]any{"type": "codex", "access_token": "outer", "refresh_token": "outer-refresh", "account_id": "account", "note": "keep", "siwc": map[string]any{"issuer": "https://auth.openai.com", "subject": "synthetic-subject", "bound_account_id": "account", "client_id": "oaiapp_issued", "device_id": "e61bbe28-07ef-466d-8e5d-a344f94ab305"}}
+ 	if errWrite := codex.WriteJSONFileAtomic(path, metadata); errWrite != nil {
+ 		t.Fatal(errWrite)
+ 	}
+@@ -158,13 +162,20 @@ func (f *siwcFixture) start(t *testing.T) (string, *siwcBindSession) {
+ 		t.Fatal(errURL)
+ 	}
+ 	q := u.Query()
+-	if q.Get("client_id") != codex.SIWCDynamicClientID || q.Get("redirect_uri") != codex.SIWCRedirectURI || q.Get("nonce") == "" || q.Get("code_challenge") == "" {
++	if q.Get("redirect_uri") != codex.SIWCRedirectURI || q.Get("nonce") == "" || q.Get("code_challenge") == "" {
+ 		t.Fatal("missing SIWC authorization parameters")
+ 	}
+ 	session, ok := f.store.Get(response.State)
+ 	if !ok || session.SIWC == nil {
+ 		t.Fatal("missing SIWC session")
+ 	}
++	expectedClient := session.SIWC.clientID
++	if expectedClient == "" {
++		expectedClient = codex.SIWCDynamicClientID
++	}
++	if q.Get("client_id") != expectedClient || (session.SIWC.clientID != "" && q.Has("agent_name_hint")) {
++		t.Fatal("incorrect selected registration")
++	}
+ 	if session.SIWC.nonce != q.Get("nonce") {
+ 		t.Fatal("pending session lost authorization nonce")
+ 	}
+@@ -248,7 +259,6 @@ func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
+ 	f := setupSIWCFlow(t, false)
+ 	state, _ := f.start(t)
+ 	cases := []map[string]any{
+-		{"state": state, "code": "code"},
+ 		{"state": state, "client_id": "client"},
+ 		{"state": state, "code": "code", "client_id": "client", "provider": "claude"},
+ 		{"state": state, "redirect_url": siwcCallbackURL("other-state")},
+@@ -819,3 +829,29 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestSIWCManagementReturningCallbackClientID(t *testing.T) {
++	for _, client := range []string{"", "oaiapp_issued", "other-client"} {
++		t.Run("client="+client, func(t *testing.T) {
++			f := setupSIWCFlow(t, false)
++			state, flow := f.start(t)
++			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"state": state, "code": "code", "client_id": client})
++			if client == "other-client" {
++				if w.Code != http.StatusBadRequest || f.service.calls.Load() != 0 {
++					t.Fatal("changed registration reached exchange")
++				}
++				return
++			}
++			if w.Code != http.StatusOK {
++				t.Fatalf("callback: %d", w.Code)
++			}
++			waitSIWCExchange(t, flow)
++			if input := <-f.service.inputs; input.clientID != "oaiapp_issued" {
++				t.Fatal("lost selected issued client")
++			}
++			if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
++				t.Fatal("returning bind failed")
++			}
++		})
++	}
++}
+diff --git a/internal/api/handlers/management/oauth_siwc_verification_test.go b/internal/api/handlers/management/oauth_siwc_verification_test.go
+index 3c29cec..c23e95e 100644
+--- a/internal/api/handlers/management/oauth_siwc_verification_test.go
++++ b/internal/api/handlers/management/oauth_siwc_verification_test.go
+@@ -22,7 +22,7 @@ func (f siwcVerificationTransport) RoundTrip(req *http.Request) (*http.Response,
+ }
+ 
+ func TestSIWCManagementVerifiesBeforeSaving(t *testing.T) {
+-	for _, mode := range []string{"valid", "signature", "nonce", "issuer", "audience"} {
++	for _, mode := range []string{"valid", "signature", "nonce", "issuer", "audience", "subject", "workspace", "initial", "legacy", "initial wrong account", "initial missing workspace"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			key, otherKey := siwctest.NewKey(t), siwctest.NewKey(t)
+ 			var idToken atomic.Value
+@@ -43,6 +43,21 @@ func TestSIWCManagementVerifiesBeforeSaving(t *testing.T) {
+ 				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+ 			})
+ 			f := setupSIWCFlow(t, false)
++			initial := strings.HasPrefix(mode, "initial") || mode == "legacy"
++			if initial {
++				outer := siwctest.Token(t, key, "test-key", codex.ClientID, "prior-login", func(doc *ojson.Doc) {
++					if errSet := doc.Set("https://api\\.openai\\.com/auth.chatgpt_account_id", "account"); errSet != nil {
++						t.Fatal(errSet)
++					}
++				})
++				metadata := map[string]any{"type": "codex", "account_id": "account", "access_token": "outer", "refresh_token": "outer-refresh", "id_token": outer, "siwc": map[string]any{"device_id": "e61bbe28-07ef-466d-8e5d-a344f94ab305"}}
++				if mode == "legacy" {
++					metadata["siwc"].(map[string]any)["client_id"] = "oaiapp_issued"
++				}
++				if errWrite := codex.WriteJSONFileAtomic(f.path, metadata); errWrite != nil {
++					t.Fatal(errWrite)
++				}
++			}
+ 			f.h.siwcOAuthFactory = func(cfg *config.Config) siwcOAuthService {
+ 				return codex.NewCodexAuth(cfg)
+ 			}
+@@ -61,7 +76,17 @@ func TestSIWCManagementVerifiesBeforeSaving(t *testing.T) {
+ 				signingKey = otherKey
+ 			}
+ 			idToken.Store(siwctest.Token(t, signingKey, "test-key", "oaiapp_issued", flow.nonce, func(doc *ojson.Doc) {
+-				field := map[string]string{"nonce": "nonce", "issuer": "iss", "audience": "aud"}[mode]
++				if initial && mode != "initial missing workspace" {
++					if errSet := doc.Set("https://api\\.openai\\.com/auth.chatgpt_account_id", "account"); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++				if mode == "initial wrong account" {
++					if errSet := doc.Set("sub", "other-subject"); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++				field := map[string]string{"nonce": "nonce", "issuer": "iss", "audience": "aud", "subject": "sub", "workspace": "https://api\\.openai\\.com/auth.chatgpt_account_id"}[mode]
+ 				if field != "" {
+ 					if errSet := doc.Set(field, "wrong-value"); errSet != nil {
+ 						t.Fatal(errSet)
+@@ -86,9 +111,9 @@ func TestSIWCManagementVerifiesBeforeSaving(t *testing.T) {
+ 				t.Fatal(errSet)
+ 			}
+ 			status := performOAuthStatusRequest(t, f.router, state)
+-			if mode == "valid" {
++			if mode == "valid" || mode == "initial" || mode == "legacy" {
+ 				if status.Status != "ok" || afterMemory.Metadata["use_siwc"] != true ||
+-					ojson.GetBytes(afterDisk, "siwc.refresh_token").String() != "new-refresh" {
++					ojson.GetBytes(afterDisk, "siwc.refresh_token").String() != "new-refresh" || ojson.GetBytes(afterDisk, "siwc.subject").String() != "synthetic-subject" || ojson.GetBytes(afterDisk, "siwc.bound_account_id").String() != "account" {
+ 					t.Fatal("verified credentials not saved")
+ 				}
+ 			} else if status.Status != "error" || string(afterDisk) != string(beforeDisk) || beforeDoc.String() != afterDoc.String() {
+diff --git a/internal/auth/codex/openai.go b/internal/auth/codex/openai.go
+index 92cd6cb..54d9a36 100644
+--- a/internal/auth/codex/openai.go
++++ b/internal/auth/codex/openai.go
+@@ -31,6 +31,10 @@ type CodexTokenData struct {
+ 
+ // CodexSIWCTokenData holds the OAuth token information obtained from OpenAI's Sign in with ChatGPT (SIWC) flow.
+ type CodexSIWCTokenData struct {
++	Issuer            string   `json:"issuer,omitempty"`
++	Subject           string   `json:"subject,omitempty"`
++	AccountID         string   `json:"verified_account_id,omitempty"`
++	BoundAccountID    string   `json:"bound_account_id,omitempty"`
+ 	AccessToken       string   `json:"access_token"`
+ 	RefreshToken      string   `json:"refresh_token"`
+ 	IDToken           string   `json:"id_token,omitempty"`
+@@ -56,6 +60,11 @@ func (d *CodexSIWCTokenData) ToMap() map[string]any {
+ 		"expired":       d.Expire,
+ 		"last_refresh":  d.LastRefresh,
+ 	}
++	for key, value := range map[string]string{"issuer": d.Issuer, "subject": d.Subject, "verified_account_id": d.AccountID, "bound_account_id": d.BoundAccountID} {
++		if value != "" {
++			out[key] = value
++		}
++	}
+ 	if d.ExpiresAt != "" {
+ 		out["expires_at"] = d.ExpiresAt
+ 	}
+diff --git a/internal/auth/codex/siwc_binding.go b/internal/auth/codex/siwc_binding.go
+new file mode 100644
+index 0000000..3c9241b
+--- /dev/null
++++ b/internal/auth/codex/siwc_binding.go
+@@ -0,0 +1,183 @@
++package codex
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/MoeForge/moego/ojson"
++	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/google/uuid"
++)
++
++var errSIWCIdentity = errors.New("SIWC account association could not be verified; renew the selected Codex login and start a new binding")
++
++// SIWCBinding is an immutable, server-owned account selection and disk baseline.
++// It is never reconstructed from callback parameters or persisted as a credential.
++type SIWCBinding struct {
++	issuer, subject, clientID, accountID string
++	baseline                             [32]byte
++	first                                bool
++}
++
++func (b *SIWCBinding) ClientID() string { return b.clientID }
++
++func siwcString(m map[string]any, key string) string {
++	s, _ := m[key].(string)
++	return s
++}
++
++func siwcBindingBaseline(metadata map[string]any) ([32]byte, error) {
++	doc := ojson.NewDocString("{}")
++	for _, key := range []string{"type", "account_id", "id_token", "access_token", "refresh_token", "siwc"} {
++		if errSet := doc.Set(key, metadata[key]); errSet != nil {
++			return [32]byte{}, errSet
++		}
++	}
++	return sha256.Sum256(doc.Bytes()), nil
++}
++
++// PrepareSIWCBinding selects an existing verified registration or verifies the
++// outer Codex ID token for first binding/legacy migration. No inference is sent.
++// Cross-client subject/workspace equivalence is deliberately fail-closed: when
++// either signed claim is unavailable or differs, binding is not supported.
++func (o *CodexAuth) PrepareSIWCBinding(ctx context.Context, metadata map[string]any) (*SIWCBinding, error) {
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	baseline, errBaseline := siwcBindingBaseline(metadata)
++	if errBaseline != nil {
++		return nil, errSIWCIdentity
++	}
++	section, _ := metadata["siwc"].(map[string]any)
++	if raw, exists := metadata["siwc"]; exists && raw != nil && section == nil {
++		return nil, errSIWCIdentity
++	}
++	for _, key := range []string{"issuer", "subject", "client_id", "bound_account_id", "device_id"} {
++		if raw, exists := section[key]; exists {
++			if _, ok := raw.(string); !ok {
++				return nil, errSIWCIdentity
++			}
++		}
++	}
++	b := &SIWCBinding{clientID: siwcString(section, "client_id"), accountID: siwcString(metadata, "account_id"), baseline: baseline}
++	if b.clientID == SIWCDynamicClientID || strings.TrimSpace(b.clientID) != b.clientID {
++		return nil, errSIWCIdentity
++	}
++	issuer, subject := siwcString(section, "issuer"), siwcString(section, "subject")
++	if issuer != "" || subject != "" {
++		if issuer != siwcIssuer || strings.TrimSpace(subject) == "" || b.clientID == "" || b.accountID == "" || siwcString(section, "bound_account_id") != b.accountID {
++			return nil, errSIWCIdentity
++		}
++		b.issuer, b.subject = issuer, subject
++		return b, nil
++	}
++	if o == nil || o.siwcKeySet == nil || b.accountID == "" {
++		return nil, errSIWCIdentity
++	}
++	// This is evidence from the selected existing login, not a new OAuth grant:
++	// there is no new nonce to compare. Require a currently valid signed token.
++	verifier := oidc.NewVerifier(siwcIssuer, o.siwcKeySet, &oidc.Config{ClientID: ClientID, SupportedSigningAlgs: []string{oidc.RS256}})
++	identity, errVerify := verifier.Verify(ctx, siwcString(metadata, "id_token"))
++	if errVerify != nil || ctx.Err() != nil {
++		return nil, errSIWCIdentity
++	}
++	var claims struct {
++		Auth struct {
++			AccountID string `json:"chatgpt_account_id"`
++		} `json:"https://api.openai.com/auth"`
++		AuthorizedParty string   `json:"azp"`
++		NotBefore       *float64 `json:"nbf"`
++	}
++	now := time.Now()
++	if identity.Claims(&claims) != nil || !identity.Expiry.After(now) ||
++		strings.TrimSpace(identity.Subject) == "" || identity.IssuedAt.IsZero() ||
++		identity.IssuedAt.After(now.Add(5*time.Second)) || !identity.Expiry.After(identity.IssuedAt) ||
++		claims.Auth.AccountID != b.accountID ||
++		(len(identity.Audience) > 1 && claims.AuthorizedParty == "") ||
++		(claims.AuthorizedParty != "" && claims.AuthorizedParty != ClientID) ||
++		(claims.NotBefore != nil && *claims.NotBefore > float64(now.Unix())+5) {
++		return nil, errSIWCIdentity
++	}
++	b.issuer, b.subject, b.first = identity.Issuer, identity.Subject, true
++	return b, nil
++}
++
++// Check must run inside the credential's write lock against its latest contents.
++// Refreshes/rebindings during authorization invalidate the attempt, rather than
++// allowing a late callback to replace newer credentials. Unrelated fields survive.
++func (b *SIWCBinding) Check(ctx context.Context, metadata map[string]any, tokens *CodexSIWCTokenData) error {
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if b == nil || tokens == nil || tokens.Issuer != b.issuer || tokens.Subject != b.subject ||
++		tokens.ClientID == "" || tokens.ClientID == SIWCDynamicClientID ||
++		(b.clientID != "" && tokens.ClientID != b.clientID) {
++		return errSIWCIdentity
++	}
++	if b.first && tokens.AccountID != b.accountID {
++		return errSIWCIdentity
++	}
++	// A signed workspace claim, when supplied on reauthorization, cannot change.
++	if tokens.AccountID != "" && tokens.AccountID != b.accountID {
++		return errSIWCIdentity
++	}
++	baseline, errBaseline := siwcBindingBaseline(metadata)
++	if errBaseline != nil || baseline != b.baseline {
++		return errors.New("SIWC binding target changed; start a new binding")
++	}
++	return nil
++}
++
++// BindAccount records the verified outer association only after Check succeeds.
++func (b *SIWCBinding) BindAccount(tokens *CodexSIWCTokenData) { tokens.BoundAccountID = b.accountID }
++
++// EnsureSIWCHostID persists one host ID per auth-directory runtime before opening
++// a browser. The non-JSON suffix keeps this state out of credential discovery.
++// An existing legacy ID can seed an empty host record, but conflicts are errors.
++func EnsureSIWCHostID(authDir, preferred string) (string, error) {
++	dir, errDir := filepath.EvalSymlinks(authDir)
++	if errDir != nil {
++		return "", errors.New("SIWC host directory is unavailable")
++	}
++	preferred = strings.ToLower(strings.TrimSpace(preferred))
++	if preferred != "" && !IsValidUUID(preferred) {
++		return "", errors.New("invalid saved SIWC host ID")
++	}
++	path := filepath.Join(dir, ".siwc-host.state")
++	var hostID string
++	errLock := WithFileLock(path, func() error {
++		info, errStat := os.Lstat(path)
++		if errStat == nil {
++			if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
++				return errors.New("SIWC host state must be a private regular file")
++			}
++			raw, errRead := os.ReadFile(path)
++			if errRead != nil {
++				return errRead
++			}
++			value := ojson.GetBytes(raw, "device_id")
++			if !ojson.ValidBytes(raw) || value.Type != ojson.String || !IsValidUUID(value.Str) {
++				return errors.New("invalid SIWC host state; refusing to regenerate it")
++			}
++			hostID = strings.ToLower(strings.TrimSpace(value.Str))
++			if preferred != "" && preferred != hostID {
++				return errors.New("saved SIWC registration belongs to a different host")
++			}
++			return nil
++		}
++		if !os.IsNotExist(errStat) {
++			return errStat
++		}
++		hostID = preferred
++		if hostID == "" {
++			hostID = uuid.NewString()
++		}
++		return WriteJSONFileAtomic(path, map[string]any{"device_id": hostID})
++	})
++	return hostID, errLock
++}
+diff --git a/internal/auth/codex/siwc_binding_test.go b/internal/auth/codex/siwc_binding_test.go
+new file mode 100644
+index 0000000..64ab9e0
+--- /dev/null
++++ b/internal/auth/codex/siwc_binding_test.go
+@@ -0,0 +1,208 @@
++package codex
++
++import (
++	"context"
++	"crypto"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/MoeForge/moego/ojson"
++	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/siwctest"
++)
++
++func TestSIWCFirstBindingRequiresSignedAccountAssociation(t *testing.T) {
++	key, otherKey := siwctest.NewKey(t), siwctest.NewKey(t)
++	auth := &CodexAuth{siwcKeySet: &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}}
++	for _, mode := range []string{"valid", "legacy", "signature", "expired", "audience", "workspace", "missing workspace", "subject mismatch", "SIWC workspace mismatch", "SIWC missing workspace"} {
++		t.Run(mode, func(t *testing.T) {
++			signer := key
++			if mode == "signature" {
++				signer = otherKey
++			}
++			outer := siwctest.Token(t, signer, "key", ClientID, "old-login-nonce", func(doc *ojson.Doc) {
++				claims := map[string]any{"https://api\\.openai\\.com/auth.chatgpt_account_id": "account"}
++				switch mode {
++				case "expired":
++					claims["exp"] = time.Now().Add(-time.Hour).Unix()
++				case "audience":
++					claims["aud"] = "other-client"
++				case "workspace":
++					claims["https://api\\.openai\\.com/auth.chatgpt_account_id"] = "other-account"
++				case "missing workspace":
++					delete(claims, "https://api\\.openai\\.com/auth.chatgpt_account_id")
++				}
++				for k, v := range claims {
++					if errSet := doc.Set(k, v); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++			})
++			metadata := map[string]any{"type": "codex", "account_id": "account", "id_token": outer, "access_token": "outer", "refresh_token": "refresh"}
++			if mode == "legacy" {
++				metadata["siwc"] = map[string]any{"client_id": "issued", "id_token": "unverified-legacy-token"}
++			}
++			binding, errPrepare := auth.PrepareSIWCBinding(context.Background(), metadata)
++			prepareOK := mode == "valid" || mode == "legacy" || strings.HasPrefix(mode, "SIWC ") || mode == "subject mismatch"
++			if !prepareOK {
++				if errPrepare == nil {
++					t.Fatal("unverified outer identity accepted")
++				}
++				return
++			}
++			if errPrepare != nil {
++				t.Fatal(errPrepare)
++			}
++			token := &CodexSIWCTokenData{ClientID: "issued", IDToken: siwctest.Token(t, key, "key", "issued", "new-nonce", func(doc *ojson.Doc) {
++				account := "account"
++				if mode == "SIWC workspace mismatch" {
++					account = "other"
++				}
++				if mode != "SIWC missing workspace" {
++					if errSet := doc.Set("https://api\\.openai\\.com/auth.chatgpt_account_id", account); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++				if mode == "subject mismatch" {
++					if errSet := doc.Set("sub", "other-subject"); errSet != nil {
++						t.Fatal(errSet)
++					}
++				}
++			})}
++			if errVerify := auth.verifySIWCIDToken(context.Background(), token, "new-nonce"); errVerify != nil {
++				t.Fatal(errVerify)
++			}
++			errCheck := binding.Check(context.Background(), metadata, token)
++			if mode != "valid" && mode != "legacy" {
++				if errCheck == nil {
++					t.Fatal("different or unproven account accepted")
++				}
++				return
++			}
++			if errCheck != nil {
++				t.Fatal(errCheck)
++			}
++			binding.BindAccount(token)
++			saved := token.ToMap()
++			if saved["issuer"] != siwcIssuer || saved["subject"] != "synthetic-subject" || saved["bound_account_id"] != "account" {
++				t.Fatal("lost verified identity")
++			}
++		})
++	}
++}
++
++func TestSIWCBindingRejectsStaleSelections(t *testing.T) {
++	metadata := map[string]any{"account_id": "account", "siwc": map[string]any{"issuer": siwcIssuer, "subject": "subject", "client_id": "issued", "bound_account_id": "account", "refresh_token": "old"}}
++	binding, errPrepare := NewCodexAuth(nil).PrepareSIWCBinding(context.Background(), metadata)
++	if errPrepare != nil {
++		t.Fatal(errPrepare)
++	}
++	token := &CodexSIWCTokenData{Issuer: siwcIssuer, Subject: "subject", ClientID: "issued"}
++	metadata["note"] = "new note"
++	if errCheck := binding.Check(context.Background(), metadata, token); errCheck != nil {
++		t.Fatal(errCheck)
++	}
++	for _, mode := range []string{"subject", "client", "disk", "cancel"} {
++		t.Run(mode, func(t *testing.T) {
++			candidate := *token
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch mode {
++			case "subject":
++				candidate.Subject = "different"
++			case "client":
++				candidate.ClientID = "other"
++			case "disk":
++				metadata["siwc"].(map[string]any)["refresh_token"] = "newer"
++				defer func() { metadata["siwc"].(map[string]any)["refresh_token"] = "old" }()
++			case "cancel":
++				cancel()
++			}
++			if binding.Check(ctx, metadata, &candidate) == nil {
++				t.Fatal("unsafe selection accepted")
++			}
++		})
++	}
++}
++
++func TestSIWCHostIDPersistsAcrossAttemptsAndProcesses(t *testing.T) {
++	dir := t.TempDir()
++	const preferred = "e61bbe28-07ef-466d-8e5d-a344f94ab305"
++	var wg sync.WaitGroup
++	for i := 0; i < 16; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			id, errHost := EnsureSIWCHostID(dir, preferred)
++			if errHost != nil || id != preferred {
++				t.Errorf("host creation: %v", errHost)
++			}
++		}()
++	}
++	wg.Wait()
++	command := exec.Command(os.Args[0], "-test.run=^TestSIWCHostProcessHelper$")
++	command.Env = append(os.Environ(), "SIWC_TEST_HOST_DIR="+dir, "SIWC_TEST_HOST_ID="+preferred)
++	if out, errRun := command.CombinedOutput(); errRun != nil {
++		t.Fatalf("restart: %v %s", errRun, out)
++	}
++	info, errStat := os.Stat(filepath.Join(dir, ".siwc-host.state"))
++	if errStat != nil || info.Mode().Perm() != 0o600 {
++		t.Fatal("host file is not private")
++	}
++	if _, errConflict := EnsureSIWCHostID(dir, "11111111-1111-1111-1111-111111111111"); errConflict == nil {
++		t.Fatal("host conflict accepted")
++	}
++}
++
++func TestSIWCHostProcessHelper(t *testing.T) {
++	dir := os.Getenv("SIWC_TEST_HOST_DIR")
++	if dir == "" {
++		t.Skip("subprocess helper")
++	}
++	id, errHost := EnsureSIWCHostID(dir, "")
++	if errHost != nil || id != os.Getenv("SIWC_TEST_HOST_ID") {
++		t.Fatal("host identity changed after restart")
++	}
++}
++
++func TestSIWCHostStateFailsClosed(t *testing.T) {
++	for _, mode := range []string{"malformed", "permissions", "symlink"} {
++		t.Run(mode, func(t *testing.T) {
++			dir := t.TempDir()
++			path := filepath.Join(dir, ".siwc-host.state")
++			original := []byte(`{"device_id":"11111111-1111-1111-1111-111111111111"}`)
++			if mode == "malformed" {
++				original = []byte(`broken`)
++			}
++			target := path
++			if mode == "symlink" {
++				target = filepath.Join(dir, "elsewhere")
++			}
++			if errWrite := os.WriteFile(target, original, 0o600); errWrite != nil {
++				t.Fatal(errWrite)
++			}
++			if mode == "permissions" {
++				if errMode := os.Chmod(path, 0o644); errMode != nil {
++					t.Fatal(errMode)
++				}
++			}
++			if mode == "symlink" {
++				if errLink := os.Symlink(target, path); errLink != nil {
++					t.Fatal(errLink)
++				}
++			}
++			if _, errHost := EnsureSIWCHostID(dir, ""); errHost == nil {
++				t.Fatal("unsafe host file accepted")
++			}
++			after, errRead := os.ReadFile(target)
++			if errRead != nil || string(after) != string(original) {
++				t.Fatal("invalid state overwritten")
++			}
++		})
++	}
++}
+diff --git a/internal/auth/codex/siwc_id_token.go b/internal/auth/codex/siwc_id_token.go
+index 3f578cc..2892544 100644
+--- a/internal/auth/codex/siwc_id_token.go
++++ b/internal/auth/codex/siwc_id_token.go
+@@ -64,6 +64,9 @@ func (o *CodexAuth) verifySIWCIDTokenWithClock(ctx context.Context, tokens *Code
+ 		return invalid
+ 	}
+ 	var extra struct {
++		Auth struct {
++			AccountID string `json:"chatgpt_account_id"`
++		} `json:"https://api.openai.com/auth"`
+ 		AuthorizedParty string   `json:"azp"`
+ 		NotBefore       *float64 `json:"nbf"`
+ 	}
+@@ -83,5 +86,6 @@ func (o *CodexAuth) verifySIWCIDTokenWithClock(ctx context.Context, tokens *Code
+ 			return invalid
+ 		}
+ 	}
++	tokens.Issuer, tokens.Subject, tokens.AccountID = identity.Issuer, identity.Subject, extra.Auth.AccountID
+ 	return nil
+ }
+diff --git a/internal/cmd/siwc_bind.go b/internal/cmd/siwc_bind.go
+index 2ec5c08..415e0ad 100644
+--- a/internal/cmd/siwc_bind.go
++++ b/internal/cmd/siwc_bind.go
+@@ -11,7 +11,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/MoeForge/moego/ojson"
+-	"github.com/google/uuid"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/browser"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+@@ -91,7 +90,7 @@ func validateSIWCBindCredential(metadata map[string]any) error {
+ 	return nil
+ }
+ 
+-func ensureSIWCDeviceIDFromFile(authFilePath string) (string, error) {
++func ensureSIWCDeviceIDFromFile(authFilePath string, authDirs ...string) (string, error) {
+ 	data, errRead := os.ReadFile(authFilePath)
+ 	if errRead != nil {
+ 		return "", fmt.Errorf("failed to read credential file: %w", errRead)
+@@ -100,15 +99,22 @@ func ensureSIWCDeviceIDFromFile(authFilePath string) (string, error) {
+ 	if errUnmarshal := json.Unmarshal(data, &parsed); errUnmarshal != nil {
+ 		return "", fmt.Errorf("invalid credential JSON: %w", errUnmarshal)
+ 	}
+-	if siwcMap, ok := parsed["siwc"].(map[string]any); ok && len(siwcMap) > 0 {
+-		if existingID, okID := siwcMap["device_id"].(string); okID && codex.IsValidUUID(existingID) {
+-			return strings.ToLower(strings.TrimSpace(existingID)), nil
++	preferred := ""
++	if siwcMap, ok := parsed["siwc"].(map[string]any); ok {
++		preferred, _ = siwcMap["device_id"].(string)
++	}
++	dir := filepath.Dir(authFilePath)
++	if len(authDirs) > 0 {
++		var errResolve error
++		dir, errResolve = util.ResolveAuthDir(authDirs[0])
++		if errResolve != nil {
++			return "", errResolve
+ 		}
+ 	}
+-	return strings.ToLower(uuid.NewString()), nil
++	return codex.EnsureSIWCHostID(dir, preferred)
+ }
+ 
+-func saveSIWCToCodexCredentialFile(authFilePath string, siwcData *codex.CodexSIWCTokenData) error {
++func saveSIWCToCodexCredentialFile(authFilePath string, siwcData *codex.CodexSIWCTokenData, binding ...*codex.SIWCBinding) error {
+ 	if siwcData == nil {
+ 		return fmt.Errorf("siwc token data is nil")
+ 	}
+@@ -125,6 +131,12 @@ func saveSIWCToCodexCredentialFile(authFilePath string, siwcData *codex.CodexSIW
+ 		if errValidate := validateSIWCBindCredential(diskMap); errValidate != nil {
+ 			return errValidate
+ 		}
++		if len(binding) > 0 {
++			if errCheck := binding[0].Check(context.Background(), diskMap, siwcData); errCheck != nil {
++				return errCheck
++			}
++			binding[0].BindAccount(siwcData)
++		}
+ 		// Binding is an explicit SIWC replacement, not a stale snapshot merge.
+ 		diskMap["use_siwc"] = true
+ 		diskMap["siwc"] = siwcData.ToMap()
+@@ -153,7 +165,7 @@ func DoSIWCBind(cfg *config.Config, target string, options *LoginOptions) {
+ 		return
+ 	}
+ 
+-	deviceID, errDevice := ensureSIWCDeviceIDFromFile(authFilePath)
++	deviceID, errDevice := ensureSIWCDeviceIDFromFile(authFilePath, cfg.AuthDir)
+ 	if errDevice != nil {
+ 		log.Errorf("siwc-bind: %v", errDevice)
+ 		return
+@@ -169,6 +181,17 @@ func DoSIWCBind(cfg *config.Config, target string, options *LoginOptions) {
+ 		return
+ 	}
+ 	savedClientID := strings.TrimSpace(registration.Str)
++	var selected map[string]any
++	if json.Unmarshal(credentialBytes, &selected) != nil {
++		log.Error("siwc-bind: invalid credential JSON")
++		return
++	}
++	authSvc := codex.NewCodexAuth(cfg)
++	binding, errBinding := authSvc.PrepareSIWCBinding(context.Background(), selected)
++	if errBinding != nil {
++		log.Errorf("siwc-bind: %v", errBinding)
++		return
++	}
+ 
+ 	callbackPort := codex.SIWCCallbackPort
+ 	if options.CallbackPort > 0 {
+@@ -210,7 +233,6 @@ func DoSIWCBind(cfg *config.Config, target string, options *LoginOptions) {
+ 		}
+ 	}()
+ 
+-	authSvc := codex.NewCodexAuth(cfg)
+ 	authURL, errURL := authSvc.GenerateSIWCAuthURL(state, nonce, deviceID, redirectURI, pkceCodes)
+ 	if savedClientID != "" {
+ 		authURL, errURL = authSvc.GenerateSIWCReauthURL(savedClientID, state, nonce, deviceID, redirectURI, pkceCodes)
+@@ -339,7 +361,7 @@ waitForCallback:
+ 		return
+ 	}
+ 
+-	if errSave := saveSIWCToCodexCredentialFile(authFilePath, siwcData); errSave != nil {
++	if errSave := saveSIWCToCodexCredentialFile(authFilePath, siwcData, binding); errSave != nil {
+ 		fmt.Printf("Failed to save SIWC credentials: %v\n", errSave)
+ 		return
+ 	}
+diff --git a/internal/cmd/siwc_reauth_test.go b/internal/cmd/siwc_reauth_test.go
+index 7310c91..8863132 100644
+--- a/internal/cmd/siwc_reauth_test.go
++++ b/internal/cmd/siwc_reauth_test.go
+@@ -28,8 +28,8 @@ func (f siwcBindRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
+ func TestDoSIWCBindReusesSavedRegistration(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name, returned, tokenMode string
+-		wantSuccess              bool
+-		wantExchanges            int
++		wantSuccess               bool
++		wantExchanges             int
+ 	}{
+ 		{"callback omits unchanged client", "", "", true, 1},
+ 		{"callback confirms saved client", "oaiapp_saved", "", true, 1},
+@@ -37,11 +37,12 @@ func TestDoSIWCBindReusesSavedRegistration(t *testing.T) {
+ 		{"invalid signature", "oaiapp_saved", "signature", false, 1},
+ 		{"wrong nonce", "oaiapp_saved", "nonce", false, 1},
+ 		{"expired token", "oaiapp_saved", "expiry", false, 1},
++		{"different account", "oaiapp_saved", "subject", false, 1},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			dir := t.TempDir()
+ 			path := filepath.Join(dir, "codex.json")
+-			const initial = `{"type":"codex","access_token":"outer","refresh_token":"outer-refresh","siwc":{"access_token":"old","refresh_token":"old-refresh","client_id":"oaiapp_saved","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305"}}`
++			const initial = `{"type":"codex","account_id":"account","access_token":"outer","refresh_token":"outer-refresh","siwc":{"issuer":"https://auth.openai.com","subject":"synthetic-subject","bound_account_id":"account","access_token":"old","refresh_token":"old-refresh","client_id":"oaiapp_saved","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305"}}`
+ 			if errWrite := os.WriteFile(path, []byte(initial), 0o600); errWrite != nil {
+ 				t.Fatal(errWrite)
+ 			}
+@@ -77,6 +78,11 @@ func TestDoSIWCBindReusesSavedRegistration(t *testing.T) {
+ 					signingKey = otherKey
+ 				}
+ 				token := siwctest.Token(t, signingKey, "test-key", "oaiapp_saved", nonce.Load().(string), func(doc *ojson.Doc) {
++					if tc.tokenMode == "subject" {
++						if errSet := doc.Set("sub", "another-subject"); errSet != nil {
++							t.Error(errSet)
++						}
++					}
+ 					if tc.tokenMode == "nonce" {
+ 						if errSet := doc.Set("nonce", "wrong-nonce"); errSet != nil {
+ 							t.Error(errSet)
+diff --git a/sdk/cliproxy/auth/codex_siwc_bind.go b/sdk/cliproxy/auth/codex_siwc_bind.go
+index a2240c8..8e5fd50 100644
+--- a/sdk/cliproxy/auth/codex_siwc_bind.go
++++ b/sdk/cliproxy/auth/codex_siwc_bind.go
+@@ -18,7 +18,20 @@ import (
+ // BindCodexSIWC explicitly replaces the SIWC partition of an existing file-backed
+ // Codex registration. Unlike ordinary persistence, a failed write never publishes
+ // credentials. expectedEpoch and expectedAccount must match the registration captured before OAuth.
++// BindCodexSIWCVerified is the OAuth entry point. The low-level BindCodexSIWC
++// API remains available to trusted SDK callers that already own authorization.
++func (m *Manager) BindCodexSIWCVerified(ctx context.Context, id string, expectedEpoch uint64, expectedAccount string, tokenData *codex.CodexSIWCTokenData, binding *codex.SIWCBinding) (*Auth, error) {
++	if binding == nil {
++		return nil, fmt.Errorf("bind SIWC: missing verified account selection")
++	}
++	return m.bindCodexSIWC(ctx, id, expectedEpoch, expectedAccount, tokenData, binding)
++}
++
+ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch uint64, expectedAccount string, tokenData *codex.CodexSIWCTokenData) (*Auth, error) {
++	return m.bindCodexSIWC(ctx, id, expectedEpoch, expectedAccount, tokenData, nil)
++}
++
++func (m *Manager) bindCodexSIWC(ctx context.Context, id string, expectedEpoch uint64, expectedAccount string, tokenData *codex.CodexSIWCTokenData, binding *codex.SIWCBinding) (*Auth, error) {
+ 	if m == nil || strings.TrimSpace(id) == "" || expectedEpoch == 0 || tokenData == nil || strings.TrimSpace(tokenData.AccessToken) == "" || strings.TrimSpace(tokenData.RefreshToken) == "" || strings.TrimSpace(tokenData.ClientID) == "" {
+ 		return nil, fmt.Errorf("bind SIWC: invalid target or token data")
+ 	}
+@@ -69,6 +82,12 @@ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch ui
+ 		if account, _ := base.Metadata["account_id"].(string); account != expectedAccount || (account != "" && disk["account_id"] != account) || (account == "" && disk["account_id"] != nil && disk["account_id"] != "") {
+ 			return fmt.Errorf("bind SIWC: backing account changed")
+ 		}
++		if binding != nil {
++			if errCheck := binding.Check(ctx, disk, tokenData); errCheck != nil {
++				return errCheck
++			}
++			binding.BindAccount(tokenData)
++		}
+ 		// Keep arbitrary disk values (including large JSON numbers) losslessly. Only
+ 		// the two explicitly bound fields are replaced; no metadata normalization runs.
+ 		var raw map[string]json.RawMessage
+diff --git a/sdk/cliproxy/auth/codex_siwc_bind_test.go b/sdk/cliproxy/auth/codex_siwc_bind_test.go
+index 7a9928c..53dc588 100644
+--- a/sdk/cliproxy/auth/codex_siwc_bind_test.go
++++ b/sdk/cliproxy/auth/codex_siwc_bind_test.go
+@@ -543,3 +543,55 @@ func TestBindCodexSIWCRejectsInPlaceRewriteDuringCommit(t *testing.T) {
+ 		t.Fatalf("binding overwrote in-place file rewrite on disk: %#v", disk)
+ 	}
+ }
++
++func TestBindCodexSIWCVerifiedRejectsLateAndWrongAccount(t *testing.T) {
++	for _, mode := range []string{"valid", "subject", "client", "late"} {
++		t.Run(mode, func(t *testing.T) {
++			manager, base, path, _ := setupSIWCBinding(t, "verified.json")
++			disk := readBindingDisk(t, path)
++			section := disk["siwc"].(map[string]any)
++			section["issuer"], section["subject"], section["bound_account_id"] = "https://auth.openai.com", "subject", "account"
++			if errWrite := codex.WriteJSONFileAtomic(path, disk); errWrite != nil {
++				t.Fatal(errWrite)
++			}
++			selection, errPrepare := codex.NewCodexAuth(nil).PrepareSIWCBinding(context.Background(), disk)
++			if errPrepare != nil {
++				t.Fatal(errPrepare)
++			}
++			tokens := bindingTokens("new")
++			tokens.Issuer, tokens.Subject = "https://auth.openai.com", "subject"
++			if mode == "subject" {
++				tokens.Subject = "other"
++			}
++			if mode == "client" {
++				tokens.ClientID = "other"
++			}
++			if mode == "late" {
++				section["refresh_token"] = "newer"
++				if errWrite := codex.WriteJSONFileAtomic(path, disk); errWrite != nil {
++					t.Fatal(errWrite)
++				}
++			}
++			before, errRead := os.ReadFile(path)
++			if errRead != nil {
++				t.Fatal(errRead)
++			}
++			beforeMemory, _ := manager.GetByID(base.ID)
++			updated, errBind := manager.BindCodexSIWCVerified(context.Background(), base.ID, base.RegistrationEpoch, "account", tokens, selection)
++			if mode == "valid" {
++				if errBind != nil || updated.Metadata["siwc"].(map[string]any)["bound_account_id"] != "account" {
++					t.Fatalf("valid identity rejected: %v", errBind)
++				}
++				return
++			}
++			after, errRead := os.ReadFile(path)
++			if errRead != nil {
++				t.Fatal(errRead)
++			}
++			afterMemory, _ := manager.GetByID(base.ID)
++			if errBind == nil || string(after) != string(before) || !reflect.DeepEqual(beforeMemory.Metadata, afterMemory.Metadata) {
++				t.Fatal("rejected binding changed credentials")
++			}
++		})
++	}
++}
+diff --git a/internal/api/server_siwc_test.go b/internal/api/server_siwc_test.go
+index e02a2d0..2c394c8 100644
+--- a/internal/api/server_siwc_test.go
++++ b/internal/api/server_siwc_test.go
+@@ -71,7 +71,7 @@ func TestCodexCallbackRejectsSIWCState(t *testing.T) {
+ 	cfg := &config.Config{}
+ 	cfg.RemoteManagement.SecretKey = string(hash)
+ 	s := newTestServerWithConfig(t, cfg)
+-	metadata := map[string]any{"type": "codex", "access_token": "outer-token", "refresh_token": "outer-refresh"}
++	metadata := map[string]any{"type": "codex", "access_token": "outer-token", "refresh_token": "outer-refresh", "account_id": "account", "siwc": map[string]any{"issuer": "https://auth.openai.com", "subject": "subject", "client_id": "oaiapp_issued", "bound_account_id": "account"}}
+ 	data, err := json.Marshal(metadata)
+ 	if err != nil {
+ 		t.Fatal(err)
